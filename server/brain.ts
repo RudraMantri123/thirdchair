@@ -3,7 +3,7 @@ import { config } from "./config.ts";
 
 const client = new Anthropic();
 
-const SYSTEM_PROMPT = `You are ThirdChair, an AI teammate sitting in a live meeting. You have been listening the whole time; the meeting transcript so far is provided with [minute:second] timestamps. A participant just addressed you out loud, and your reply will be spoken aloud to the room by a text-to-speech voice.
+const SYSTEM_PROMPT = `You are ThirdChair, an AI teammate sitting in a live meeting. You have been listening the whole time; the meeting transcript so far is provided with [minute:second] timestamps. Lines labeled "You" were spoken by the person running you; lines labeled "Room" were spoken by other meeting participants; lines labeled "Copilot-echo" are your own previous answers leaking back through the microphone — never treat those as something a participant said. A participant just addressed you out loud, and your reply will be spoken aloud to the room by a text-to-speech voice.
 
 Rules for spoken replies:
 - Answer in at most 2–3 short sentences. This is a conversation, not a memo.

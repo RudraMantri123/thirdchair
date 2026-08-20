@@ -67,6 +67,12 @@ h1 {
   animation: pulse 2s infinite;
 }
 
+.orb[data-state="awaiting_question"] {
+  background: var(--accent);
+  box-shadow: 0 0 16px var(--accent);
+  animation: pulse 0.6s infinite;
+}
+
 .orb[data-state="thinking"] {
   background: #facc15;
   box-shadow: 0 0 12px #facc15;

@@ -1,36 +1,31 @@
-interface Entry {
-  at: number;
-  text: string;
-  // True if ThirdChair was speaking when this was heard — likely its own
-  // voice echoing back, so it's labeled in the context sent to Claude.
-  whileSpeaking: boolean;
-}
+import type { Speaker, TranscriptEntry } from "../shared/protocol.ts";
 
-const MAX_ENTRIES = 2000;
+const MAX_ENTRIES = 5000;
 
-/** Rolling transcript of everything heard since the session started. */
+/** Rolling, speaker-attributed transcript of everything heard this session. */
 export class TranscriptStore {
-  private entries: Entry[] = [];
+  private entries: TranscriptEntry[] = [];
   readonly startedAt = Date.now();
 
-  add(text: string, whileSpeaking: boolean): Entry {
-    const entry = { at: Date.now(), text, whileSpeaking };
+  add(speaker: Speaker, text: string, whileSpeaking: boolean): TranscriptEntry {
+    const entry: TranscriptEntry = {
+      at: Date.now(),
+      speaker,
+      text,
+      whileSpeaking,
+    };
     this.entries.push(entry);
     if (this.entries.length > MAX_ENTRIES) this.entries.shift();
     return entry;
   }
 
-  /** Meeting context for Claude: timestamped lines, oldest first. */
+  /** Meeting context for Claude: timestamped, speaker-labeled, oldest first. */
   render(maxChars = 24000): string {
     const lines: string[] = [];
     let total = 0;
     for (let i = this.entries.length - 1; i >= 0; i--) {
       const e = this.entries[i];
-      const mins = Math.floor((e.at - this.startedAt) / 60000);
-      const secs = Math.floor(((e.at - this.startedAt) % 60000) / 1000);
-      const stamp = `[${mins}:${String(secs).padStart(2, "0")}]`;
-      const who = e.whileSpeaking ? " (copilot speaking)" : "";
-      const line = `${stamp}${who} ${e.text}`;
+      const line = `${this.stamp(e.at)} ${this.label(e)}: ${e.text}`;
       total += line.length + 1;
       if (total > maxChars) break;
       lines.push(line);
@@ -38,7 +33,19 @@ export class TranscriptStore {
     return lines.reverse().join("\n");
   }
 
-  get isEmpty(): boolean {
-    return this.entries.length === 0;
+  export(): TranscriptEntry[] {
+    return [...this.entries];
+  }
+
+  private stamp(at: number): string {
+    const elapsed = at - this.startedAt;
+    const mins = Math.floor(elapsed / 60000);
+    const secs = Math.floor((elapsed % 60000) / 1000);
+    return `[${mins}:${String(secs).padStart(2, "0")}]`;
+  }
+
+  private label(e: TranscriptEntry): string {
+    if (e.whileSpeaking) return "Copilot-echo";
+    return e.speaker === "you" ? "You" : "Room";
   }
 }

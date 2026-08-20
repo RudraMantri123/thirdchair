@@ -5,50 +5,80 @@ import { Trigger } from "./trigger.ts";
 import { answer, type AnswerHandle } from "./brain.ts";
 import { TtsSpeaker, SentenceChunker } from "./tts.ts";
 import { config } from "./config.ts";
-import type { ClientMessage, ServerMessage } from "../shared/protocol.ts";
+import {
+  CHANNEL_MIC,
+  CHANNEL_TAB,
+  SPEAKER_BY_CHANNEL,
+  type AudioChannel,
+  type ClientMessage,
+  type ServerMessage,
+  type SessionState,
+  type Speaker,
+} from "../shared/protocol.ts";
+
+const AWAIT_QUESTION_MS = 10000;
 
 /**
- * One connected browser = one Session. Owns the STT stream, the rolling
- * transcript, wake-phrase detection, and the answer pipeline
- * (Claude -> sentence chunker -> ElevenLabs TTS -> client).
+ * One connected browser = one Session.
+ *
+ * Runs one STT stream per audio channel (mic / shared meeting tab) so every
+ * transcript segment carries its speaker — unmixed streams instead of
+ * diarization, the way Recall.ai attributes audio per participant. The
+ * session itself is an explicit state machine; every transition is pushed
+ * to the client.
  */
 export class Session {
-  private stt = new SttStream();
+  private stt = new Map<AudioChannel, SttStream>();
   private transcript = new TranscriptStore();
   private trigger = new Trigger(config.wakePhrase);
+  private state: SessionState = "idle";
+  private active = false;
   private currentAnswer: AnswerHandle | null = null;
   private currentSpeaker: TtsSpeaker | null = null;
-  private speaking = false;
+  private awaitTimer: NodeJS.Timeout | null = null;
 
   constructor(private ws: WebSocket) {
-    this.stt.on("partial", (text) => this.send({ type: "partial", text }));
-    this.stt.on("committed", (text) => this.onCommitted(text));
-    this.stt.on("error", (message) => this.send({ type: "error", message }));
-
     ws.on("message", (data, isBinary) => {
       if (isBinary) {
-        this.stt.send(data as Buffer);
+        this.onAudio(data as Buffer);
       } else {
-        this.onControl(JSON.parse(data.toString()) as ClientMessage);
+        try {
+          this.onControl(JSON.parse(data.toString()) as ClientMessage);
+        } catch {
+          this.send({ type: "error", message: "Malformed client message." });
+        }
       }
     });
     ws.on("close", () => this.destroy());
 
-    this.send({ type: "ready", wakePhrase: config.wakePhrase });
+    this.send({ type: "ready", wakePhrase: config.wakePhrase, state: this.state });
+  }
+
+  // ---- inbound ----------------------------------------------------------
+
+  private onAudio(frame: Buffer): void {
+    if (frame.length < 2 || this.state === "idle") return;
+    const channel = frame[0] as AudioChannel;
+    if (channel !== CHANNEL_MIC && channel !== CHANNEL_TAB) return;
+    this.channelStt(channel).send(frame.subarray(1));
   }
 
   private onControl(msg: ClientMessage): void {
     switch (msg.type) {
       case "start":
-        this.stt.start();
-        this.send({ type: "status", message: "listening" });
+        // STT streams connect lazily on first audio for their channel.
+        this.active = true;
+        this.setState("listening");
         break;
       case "stop":
-        this.stt.stop();
-        this.send({ type: "status", message: "stopped" });
+        this.active = false;
+        this.interrupt();
+        for (const stt of this.stt.values()) stt.stop();
+        this.stt.clear();
+        this.setState("idle");
         break;
       case "ask":
-        if (msg.text.trim()) this.ask(msg.text.trim());
+        if (msg.text.trim()) this.ask(msg.text.trim(), "you");
         break;
       case "cancel":
         this.interrupt();
@@ -56,60 +86,87 @@ export class Session {
       case "config":
         if (msg.wakePhrase?.trim()) this.trigger.setPhrase(msg.wakePhrase);
         break;
+      case "export":
+        this.send({
+          type: "transcript_export",
+          startedAt: this.transcript.startedAt,
+          entries: this.transcript.export(),
+        });
+        break;
     }
   }
 
-  private onCommitted(text: string): void {
-    const entry = this.transcript.add(text, this.speaking);
-    this.send({
-      type: "committed",
-      text,
-      at: entry.at,
-      whileSpeaking: entry.whileSpeaking,
-    });
+  private channelStt(channel: AudioChannel): SttStream {
+    let stt = this.stt.get(channel);
+    if (!stt) {
+      stt = new SttStream();
+      const speaker = SPEAKER_BY_CHANNEL[channel];
+      stt.on("partial", (text) => this.send({ type: "partial", speaker, text }));
+      stt.on("committed", (text) => this.onCommitted(speaker, text));
+      stt.on("error", (message) => this.send({ type: "error", message }));
+      stt.start();
+      this.stt.set(channel, stt);
+    }
+    return stt;
+  }
 
-    if (this.speaking) {
-      // Only a renewed wake phrase cuts through while the copilot talks —
-      // everything else is probably its own voice echoing into the mic.
+  // ---- transcript / trigger ---------------------------------------------
+
+  private onCommitted(speaker: Speaker, text: string): void {
+    const speaking = this.state === "speaking" || this.state === "thinking";
+    const entry = this.transcript.add(speaker, text, speaking);
+    this.send({ type: "committed", entry });
+
+    if (speaking) {
+      // While answering, only a renewed wake phrase cuts through —
+      // everything else may be ThirdChair's own voice echoing back.
       if (this.trigger.mentioned(text)) {
         this.interrupt();
         const res = this.trigger.feed(text);
-        if (res && "question" in res) this.ask(res.question);
-        else this.send({ type: "listening_for_question" });
+        if (res && "question" in res) this.ask(res.question, speaker);
+        else this.awaitQuestion();
       }
       return;
     }
 
     const res = this.trigger.feed(text);
     if (!res) return;
-    if ("question" in res) this.ask(res.question);
-    else this.send({ type: "listening_for_question" });
+    if ("question" in res) this.ask(res.question, speaker);
+    else this.awaitQuestion();
   }
 
-  private ask(question: string): void {
+  private awaitQuestion(): void {
+    this.setState("awaiting_question");
+    this.clearAwaitTimer();
+    this.awaitTimer = setTimeout(() => {
+      if (this.state === "awaiting_question") this.setState("listening");
+    }, AWAIT_QUESTION_MS);
+  }
+
+  // ---- answer pipeline ----------------------------------------------------
+
+  private ask(question: string, speaker: Speaker): void {
     this.interrupt();
-    this.send({ type: "triggered", question });
+    this.send({ type: "triggered", question, speaker });
+    this.setState("thinking");
 
-    const speaker = new TtsSpeaker();
-    this.currentSpeaker = speaker;
-    this.speaking = true;
-    this.send({ type: "speaking_start" });
+    const tts = new TtsSpeaker();
+    this.currentSpeaker = tts;
 
-    speaker.on("audio", (pcm) => {
+    tts.on("audio", (pcm) => {
+      // First audio chunk is the thinking -> speaking transition.
+      if (this.state === "thinking") this.setState("speaking");
       if (this.ws.readyState === this.ws.OPEN) this.ws.send(pcm);
     });
-    speaker.on("error", (message) => this.send({ type: "error", message }));
-    speaker.on("done", () => {
-      if (this.currentSpeaker === speaker) {
-        this.speaking = false;
+    tts.on("error", (message) => this.send({ type: "error", message }));
+    tts.on("done", () => {
+      if (this.currentSpeaker === tts) {
         this.currentSpeaker = null;
-        this.send({ type: "speaking_end" });
+        this.settle();
       }
     });
 
-    const chunker = new SentenceChunker((sentence) => {
-      void speaker.speak(sentence);
-    });
+    const chunker = new SentenceChunker((sentence) => void tts.speak(sentence));
 
     const handle = answer(question, this.transcript.render(), (delta) => {
       chunker.push(delta);
@@ -120,19 +177,17 @@ export class Session {
     handle.done
       .then((text) => {
         chunker.flush();
-        void speaker.end();
+        void tts.end();
         this.send({ type: "answer_done", text });
       })
       .catch((err: unknown) => {
-        if (this.currentAnswer === handle) {
-          speaker.abort();
-          this.speaking = false;
-          this.currentSpeaker = null;
-          this.send({ type: "speaking_end" });
-          const message = err instanceof Error ? err.message : String(err);
-          if (!/aborted/i.test(message)) {
-            this.send({ type: "error", message: `Claude: ${message}` });
-          }
+        if (this.currentAnswer !== handle) return; // superseded / barged in
+        tts.abort();
+        this.currentSpeaker = null;
+        this.settle();
+        const message = err instanceof Error ? err.message : String(err);
+        if (!/aborted/i.test(message)) {
+          this.send({ type: "error", message: `Claude: ${message}` });
         }
       });
   }
@@ -144,9 +199,29 @@ export class Session {
     if (this.currentSpeaker) {
       this.currentSpeaker.abort();
       this.currentSpeaker = null;
-      this.speaking = false;
       this.send({ type: "speaking_cancel" });
-      this.send({ type: "speaking_end" });
+    }
+    if (this.state === "thinking" || this.state === "speaking") this.settle();
+  }
+
+  // ---- state machine ------------------------------------------------------
+
+  private setState(state: SessionState): void {
+    if (state === this.state) return;
+    if (state !== "awaiting_question") this.clearAwaitTimer();
+    this.state = state;
+    this.send({ type: "state", state });
+  }
+
+  /** Return to listening if the session is live, otherwise idle. */
+  private settle(): void {
+    this.setState(this.active ? "listening" : "idle");
+  }
+
+  private clearAwaitTimer(): void {
+    if (this.awaitTimer) {
+      clearTimeout(this.awaitTimer);
+      this.awaitTimer = null;
     }
   }
 
@@ -158,6 +233,8 @@ export class Session {
 
   private destroy(): void {
     this.interrupt();
-    this.stt.stop();
+    this.clearAwaitTimer();
+    for (const stt of this.stt.values()) stt.stop();
+    this.stt.clear();
   }
 }

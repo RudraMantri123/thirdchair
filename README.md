@@ -21,12 +21,13 @@ Every hop is a websocket and the audio stays raw PCM on both sides — no file e
 ## What it does
 
 - **Always listening** — live transcription of your mic, with interim (partial) text in the UI and VAD-committed segments in the rolling transcript.
-- **Hears the whole meeting, not just you** — click *"+ Meeting tab audio"* and share your Google Meet / Zoom tab; its audio is mixed into the same transcript. Everyone's words become context.
+- **Hears the whole meeting, not just you** — click *"+ Meeting tab audio"* and share your Google Meet / Zoom tab. Its audio becomes a second transcript channel, so every line is attributed: **You** vs **Room**.
 - **Wake phrase, fuzzy-matched** — "hey copilot", "hey co-pilot", "hey, copilot…" all work. Say the phrase alone and it waits for your question.
 - **Grounded answers** — "what did we decide", "who owns the follow-up", "summarize the last ten minutes" are answered from the transcript with timestamps, not hallucinated.
 - **Speaks in 2–3 sentences** — answers are generated in spoken style and streamed sentence-by-sentence into TTS, so time-to-first-word stays low.
 - **Barge-in** — say the wake phrase again (or hit *Stop speaking*) while it's talking and it shuts up instantly and listens.
 - **Echo-aware** — mic capture runs with echo cancellation, and anything transcribed while ThirdChair itself is speaking is flagged so it doesn't take its own voice as meeting content.
+- **Transcript export** — one click downloads the speaker-attributed, timestamped transcript for minutes/notes.
 
 ## Quickstart
 
@@ -90,6 +91,16 @@ shared/         websocket protocol types shared by both sides
 ```
 
 Latency budget per answer: STT commit (~150 ms after you stop) → Claude first sentence (streamed) → Flash TTS first audio (~75 ms model latency) → playback. In practice the voice starts within roughly a second of you finishing the question.
+
+### Design notes (patterns borrowed from Recall.ai)
+
+The architecture deliberately mirrors how [Recall.ai](https://docs.recall.ai/docs/real-time-websocket-endpoints) structures meeting bots:
+
+- **Unmixed audio channels, not diarization.** Recall attributes speech by giving you [separate audio streams per participant](https://docs.recall.ai/docs/how-to-get-separate-audio-per-participant-realtime) instead of guessing speakers from a mixed signal. ThirdChair does the same at its scale: the mic and the shared meeting tab travel as separate tagged channels, each with its own Scribe STT stream, so speaker attribution is a property of the stream — free and always correct.
+- **Explicit lifecycle states.** Like a Recall bot's `joining → in_call_recording → done` status events, a session here is a state machine (`idle → listening → awaiting_question → thinking → speaking`) and every transition is an event on the wire. The UI renders state; it never infers it.
+- **Typed event stream.** Everything between browser and server is a discriminated-union message (`shared/protocol.ts`) — binary frames for audio, JSON events for everything else, one shared type definition on both sides.
+- **Reliability semantics.** Server-side ping/terminate heartbeats reap dead sessions; the client reconnects with exponential backoff and re-arms itself mid-meeting.
+- **Artifact retrieval.** As with Recall's post-call transcript API, the full speaker-attributed transcript is exportable at any point during the session.
 
 ## Roadmap
 

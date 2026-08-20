@@ -34,7 +34,25 @@ const server = createServer(async (req, res) => {
 });
 
 const wss = new WebSocketServer({ server, path: "/ws" });
-wss.on("connection", (ws) => new Session(ws));
+
+// Heartbeat: ping every 30 s, drop connections that never pong, so dead
+// sessions release their STT streams instead of leaking.
+const alive = new WeakMap<import("ws").WebSocket, boolean>();
+wss.on("connection", (ws) => {
+  alive.set(ws, true);
+  ws.on("pong", () => alive.set(ws, true));
+  new Session(ws);
+});
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (alive.get(ws) === false) {
+      ws.terminate();
+      continue;
+    }
+    alive.set(ws, false);
+    ws.ping();
+  }
+}, 30000).unref();
 
 server.listen(config.port, () => {
   console.log(`ThirdChair server on http://localhost:${config.port}`);

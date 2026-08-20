@@ -1,6 +1,12 @@
 import { AudioCapture } from "./audio/capture.ts";
 import { AudioPlayback } from "./audio/playback.ts";
-import type { ClientMessage, ServerMessage } from "../../shared/protocol.ts";
+import type {
+  AudioChannel,
+  ClientMessage,
+  ServerMessage,
+  SessionState,
+  TranscriptEntry,
+} from "../../shared/protocol.ts";
 
 const $ = <T extends HTMLElement>(id: string) =>
   document.getElementById(id) as T;
@@ -11,68 +17,96 @@ const feed = $("feed");
 const btnStart = $<HTMLButtonElement>("btn-start");
 const btnTab = $<HTMLButtonElement>("btn-tab");
 const btnStopSpeaking = $<HTMLButtonElement>("btn-stop-speaking");
+const btnExport = $<HTMLButtonElement>("btn-export");
 const askForm = $<HTMLFormElement>("ask-form");
 const askInput = $<HTMLInputElement>("ask-input");
 const wakeDisplay = $("wake-display");
 
-const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
-const ws = new WebSocket(wsUrl);
-ws.binaryType = "arraybuffer";
-
 const playback = new AudioPlayback();
-const capture = new AudioCapture((pcm) => {
-  if (ws.readyState === WebSocket.OPEN) ws.send(pcm);
-});
+const capture = new AudioCapture((channel, pcm) => sendAudio(channel, pcm));
 
+let ws: WebSocket | null = null;
+let reconnectDelay = 500;
 let listening = false;
-let partialEl: HTMLElement | null = null;
+let partials = new Map<string, HTMLElement>();
 let answerEl: HTMLElement | null = null;
 
+// ---- websocket with auto-reconnect ---------------------------------------
+
+function connect(): void {
+  const url = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    reconnectDelay = 500;
+    // Resume seamlessly if we were mid-session when the socket dropped.
+    if (listening) send({ type: "start" });
+  };
+
+  ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      playback.play(e.data);
+      return;
+    }
+    onServerMessage(JSON.parse(e.data as string) as ServerMessage);
+  };
+
+  ws.onclose = () => {
+    setState("idle");
+    statusEl.textContent = "reconnecting…";
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+  };
+}
+
 function send(msg: ClientMessage): void {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
-function setState(state: "idle" | "listening" | "thinking" | "speaking"): void {
-  orb.dataset.state = state;
-  statusEl.textContent = state;
+function sendAudio(channel: AudioChannel, pcm: ArrayBuffer): void {
+  if (ws?.readyState !== WebSocket.OPEN) return;
+  const frame = new Uint8Array(1 + pcm.byteLength);
+  frame[0] = channel;
+  frame.set(new Uint8Array(pcm), 1);
+  ws.send(frame);
 }
 
-function addLine(cls: string, text: string): HTMLElement {
-  const el = document.createElement("div");
-  el.className = `line ${cls}`;
-  el.textContent = text;
-  feed.appendChild(el);
-  feed.scrollTop = feed.scrollHeight;
-  return el;
-}
+// ---- server events ---------------------------------------------------------
 
-ws.onmessage = (e) => {
-  if (e.data instanceof ArrayBuffer) {
-    playback.play(e.data);
-    return;
-  }
-  const msg = JSON.parse(e.data as string) as ServerMessage;
+function onServerMessage(msg: ServerMessage): void {
   switch (msg.type) {
     case "ready":
       wakeDisplay.textContent = msg.wakePhrase;
-      setState("idle");
+      setState(msg.state);
       break;
-    case "partial":
-      if (!partialEl) partialEl = addLine("partial", "");
-      partialEl.textContent = msg.text;
+    case "state":
+      setState(msg.state);
+      if (msg.state === "awaiting_question") {
+        addLine("event", "🪑 Yes? Listening for your question…");
+      }
+      break;
+    case "partial": {
+      let el = partials.get(msg.speaker);
+      if (!el) {
+        el = addLine("partial", "");
+        partials.set(msg.speaker, el);
+      }
+      el.textContent = `${speakerBadge(msg.speaker)} ${msg.text}`;
       feed.scrollTop = feed.scrollHeight;
       break;
-    case "committed":
-      partialEl?.remove();
-      partialEl = null;
-      addLine(msg.whileSpeaking ? "heard muted" : "heard", msg.text);
+    }
+    case "committed": {
+      partials.get(msg.entry.speaker)?.remove();
+      partials.delete(msg.entry.speaker);
+      addLine(
+        msg.entry.whileSpeaking ? "heard muted" : "heard",
+        `${speakerBadge(msg.entry.speaker)} ${msg.entry.text}`,
+      );
       break;
-    case "listening_for_question":
-      addLine("event", "🪑 Yes? Listening for your question…");
-      break;
+    }
     case "triggered":
       addLine("event", `🪑 Asked: “${msg.question}”`);
-      setState("thinking");
       answerEl = addLine("answer", "");
       break;
     case "answer_delta":
@@ -84,29 +118,55 @@ ws.onmessage = (e) => {
     case "answer_done":
       answerEl = null;
       break;
-    case "speaking_start":
-      setState("speaking");
-      btnStopSpeaking.disabled = false;
-      break;
     case "speaking_cancel":
       playback.cancel();
       break;
-    case "speaking_end":
-      btnStopSpeaking.disabled = true;
-      setState(listening ? "listening" : "idle");
-      break;
-    case "status":
+    case "transcript_export":
+      downloadTranscript(msg.startedAt, msg.entries);
       break;
     case "error":
       addLine("error", `⚠ ${msg.message}`);
       break;
   }
-};
+}
 
-ws.onclose = () => {
-  setState("idle");
-  addLine("error", "⚠ Connection lost — reload the page.");
-};
+function speakerBadge(speaker: "you" | "room"): string {
+  return speaker === "you" ? "🎙" : "👥";
+}
+
+function setState(state: SessionState): void {
+  orb.dataset.state = state;
+  statusEl.textContent = state.replace("_", " ");
+  btnStopSpeaking.disabled = state !== "speaking" && state !== "thinking";
+}
+
+function addLine(cls: string, text: string): HTMLElement {
+  const el = document.createElement("div");
+  el.className = `line ${cls}`;
+  el.textContent = text;
+  feed.appendChild(el);
+  feed.scrollTop = feed.scrollHeight;
+  return el;
+}
+
+function downloadTranscript(startedAt: number, entries: TranscriptEntry[]): void {
+  const lines = entries.map((e) => {
+    const elapsed = e.at - startedAt;
+    const stamp = `${Math.floor(elapsed / 60000)}:${String(
+      Math.floor((elapsed % 60000) / 1000),
+    ).padStart(2, "0")}`;
+    const who = e.whileSpeaking ? "copilot" : e.speaker;
+    return `[${stamp}] ${who}: ${e.text}`;
+  });
+  const blob = new Blob([lines.join("\n") + "\n"], { type: "text/plain" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `thirdchair-${new Date(startedAt).toISOString().slice(0, 16)}.txt`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ---- controls ---------------------------------------------------------------
 
 btnStart.onclick = async () => {
   if (!listening) {
@@ -120,14 +180,12 @@ btnStart.onclick = async () => {
     listening = true;
     btnStart.textContent = "Stop listening";
     btnTab.disabled = false;
-    setState("listening");
   } else {
     capture.stop();
     send({ type: "stop" });
     listening = false;
     btnStart.textContent = "Start listening";
     btnTab.disabled = true;
-    setState("idle");
   }
 };
 
@@ -146,6 +204,8 @@ btnStopSpeaking.onclick = () => {
   playback.cancel();
 };
 
+btnExport.onclick = () => send({ type: "export" });
+
 askForm.onsubmit = (e) => {
   e.preventDefault();
   const text = askInput.value.trim();
@@ -153,3 +213,5 @@ askForm.onsubmit = (e) => {
   send({ type: "ask", text });
   askInput.value = "";
 };
+
+connect();
