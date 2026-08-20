@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ThirdChair</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🪑</text></svg>" />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="brand">
+          <span class="orb" id="orb"></span>
+          <h1>ThirdChair</h1>
+        </div>
+        <p class="tagline">
+          The AI teammate at the table. Say
+          “<strong id="wake-display">hey copilot</strong>” and ask.
+        </p>
+      </header>
+
+      <section class="controls">
+        <button id="btn-start" class="primary">Start listening</button>
+        <button id="btn-tab" disabled title="Share your Meet/Zoom tab so ThirdChair hears everyone, not just your mic">
+          + Meeting tab audio
+        </button>
+        <button id="btn-stop-speaking" disabled>Stop speaking</button>
+        <span class="status" id="status">idle</span>
+      </section>
+
+      <section class="feed" id="feed" aria-live="polite"></section>
+
+      <form class="ask" id="ask-form">
+        <input
+          id="ask-input"
+          type="text"
+          placeholder="…or type a question instead of saying the wake phrase"
+          autocomplete="off"
+        />
+        <button type="submit">Ask</button>
+      </form>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
