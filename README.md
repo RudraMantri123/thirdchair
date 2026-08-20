@@ -54,7 +54,25 @@ npm start        # serves the built UI + websocket on :8787
 
 ## Run it 100% free
 
-No key can be bundled with the repo — but the whole stack runs on free tiers:
+No key can be bundled with the repo — but the whole stack runs free, two ways:
+
+### Zero keys at all (fully local, macOS)
+
+```bash
+brew install whisper-cpp
+# get the model (~150 MB): from Hugging Face…
+curl -L -o ~/.cache/whisper/ggml-base.en.bin --create-dirs \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+npm run voice:local        # starts whisper-server on :8788
+```
+
+Then in `.env`: `THIRDCHAIR_VOICE=local` (this is already the default when no ElevenLabs key is set) plus a free brain (below). Listening runs on whisper.cpp (Metal-accelerated), speech output uses macOS's built-in synthesizer. Nothing leaves your machine.
+
+> Corporate network blocking Hugging Face? Download OpenAI's original weights from their own CDN and convert: `curl -O https://openaipublic.azureedge.net/main/whisper/models/25a8566e1d0c1e2231d1c762132cd20e0f96a85d16145c3a00adf5d1ac670ead/base.en.pt`, then run whisper.cpp's `models/convert-pt-to-ggml.py`.
+
+Verify the whole loop without a microphone: `npx tsx scripts/e2e-voice-test.ts` synthesizes a spoken question, streams it in as fake mic audio, and prints every event through to the spoken answer.
+
+### Free tiers (better quality)
 
 - **Voice (STT + TTS):** the ElevenLabs **free tier** includes enough credits for real testing — sign up and copy the key.
 - **Brain, option A — Groq (free tier, very fast):** grab a free key at [console.groq.com/keys](https://console.groq.com/keys) (no card), then in `.env`:
@@ -86,7 +104,10 @@ Everything is in `.env`:
 
 | Variable | Default | What it does |
 |---|---|---|
+| `THIRDCHAIR_VOICE` | auto | `elevenlabs` when a key is set, else `local` (whisper.cpp + macOS say) |
 | `ELEVENLABS_API_KEY` | — | STT (Scribe v2 Realtime) + TTS (Flash v2.5) |
+| `WHISPER_URL` | `http://localhost:8788` | whisper-server endpoint for local voice |
+| `THIRDCHAIR_VAD_THRESHOLD` | `600` | Mic energy gate for local voice detection |
 | `THIRDCHAIR_BRAIN` | `claude` | `claude`, `groq` (free tier), or `ollama` (free, local, keyless) |
 | `ANTHROPIC_API_KEY` | — | Required when brain is `claude` |
 | `GROQ_API_KEY` | — | Required when brain is `groq` (free at console.groq.com) |

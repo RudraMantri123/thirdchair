@@ -1,6 +1,7 @@
 import "dotenv/config";
 
 export type BrainProvider = "claude" | "groq" | "ollama";
+export type VoiceProvider = "elevenlabs" | "local";
 
 /** Returns the env var, treating unset/placeholder values as missing. */
 function key(name: string): string | undefined {
@@ -16,8 +17,16 @@ if (!["claude", "groq", "ollama"].includes(brain)) {
   process.exit(1);
 }
 
+const elevenLabsApiKey = key("ELEVENLABS_API_KEY");
+
 export const config = {
-  elevenLabsApiKey: key("ELEVENLABS_API_KEY"),
+  elevenLabsApiKey,
+  // Voice defaults to ElevenLabs when a key is present, otherwise the fully
+  // local pipeline (whisper.cpp STT + macOS `say` TTS) — no key needed.
+  voice: (process.env.THIRDCHAIR_VOICE ??
+    (elevenLabsApiKey ? "elevenlabs" : "local")) as VoiceProvider,
+  whisperUrl: process.env.WHISPER_URL ?? "http://localhost:8788",
+  vadThreshold: Number(process.env.THIRDCHAIR_VAD_THRESHOLD ?? 600),
   anthropicApiKey: key("ANTHROPIC_API_KEY"),
   groqApiKey: key("GROQ_API_KEY"),
   brain,
@@ -36,8 +45,11 @@ export const config = {
 
 /** Why voice (STT + TTS) can't run, or undefined if it can. */
 export function voiceProblem(): string | undefined {
-  if (!config.elevenLabsApiKey) {
-    return "ELEVENLABS_API_KEY is not set — voice in/out is disabled (answers will be text-only). Free key at https://elevenlabs.io, then edit .env and restart.";
+  if (config.voice === "elevenlabs" && !config.elevenLabsApiKey) {
+    return "ELEVENLABS_API_KEY is not set — voice in/out is disabled (answers will be text-only). Free key at https://elevenlabs.io, or go fully local with THIRDCHAIR_VOICE=local (see README).";
+  }
+  if (config.voice === "local" && process.platform !== "darwin") {
+    return "THIRDCHAIR_VOICE=local uses macOS `say` for speech output and currently only supports macOS. Use ELEVENLABS_API_KEY instead.";
   }
   return undefined;
 }
@@ -58,6 +70,12 @@ export function configProblems(): string[] {
   return [voiceProblem(), brainProblem()].filter(
     (p): p is string => p !== undefined,
   );
+}
+
+export function voiceLabel(): string {
+  return config.voice === "elevenlabs"
+    ? "elevenlabs (scribe v2 + flash v2.5)"
+    : `local (whisper.cpp @ ${config.whisperUrl} + macOS say)`;
 }
 
 export function brainLabel(): string {

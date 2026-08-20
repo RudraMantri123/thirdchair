@@ -1,9 +1,11 @@
 import type WebSocket from "ws";
 import { SttStream } from "./stt.ts";
+import { LocalSttStream } from "./stt-local.ts";
 import { TranscriptStore } from "./transcript.ts";
 import { Trigger } from "./trigger.ts";
 import { answer, type AnswerHandle } from "./brain.ts";
 import { TtsSpeaker, SentenceChunker } from "./tts.ts";
+import { LocalTtsSpeaker } from "./tts-local.ts";
 import {
   config,
   configProblems,
@@ -23,6 +25,17 @@ import {
 
 const AWAIT_QUESTION_MS = 10000;
 
+type AnyStt = SttStream | LocalSttStream;
+type AnyTts = TtsSpeaker | LocalTtsSpeaker;
+
+function createStt(): AnyStt {
+  return config.voice === "local" ? new LocalSttStream() : new SttStream();
+}
+
+function createTts(): AnyTts {
+  return config.voice === "local" ? new LocalTtsSpeaker() : new TtsSpeaker();
+}
+
 /**
  * One connected browser = one Session.
  *
@@ -33,13 +46,13 @@ const AWAIT_QUESTION_MS = 10000;
  * to the client.
  */
 export class Session {
-  private stt = new Map<AudioChannel, SttStream>();
+  private stt = new Map<AudioChannel, AnyStt>();
   private transcript = new TranscriptStore();
   private trigger = new Trigger(config.wakePhrase);
   private state: SessionState = "idle";
   private active = false;
   private currentAnswer: AnswerHandle | null = null;
-  private currentSpeaker: TtsSpeaker | null = null;
+  private currentSpeaker: AnyTts | null = null;
   private awaitTimer: NodeJS.Timeout | null = null;
 
   constructor(private ws: WebSocket) {
@@ -66,9 +79,9 @@ export class Session {
 
   private onAudio(frame: Buffer): void {
     if (frame.length < 2 || this.state === "idle") return;
-    // Without a valid ElevenLabs key every connection is doomed —
+    // Without a working voice provider every connection is doomed —
     // drop audio instead of opening sockets that can only fail.
-    if (!config.elevenLabsApiKey) return;
+    if (voiceProblem()) return;
     const channel = frame[0] as AudioChannel;
     if (channel !== CHANNEL_MIC && channel !== CHANNEL_TAB) return;
     this.channelStt(channel).send(frame.subarray(1));
@@ -107,10 +120,10 @@ export class Session {
     }
   }
 
-  private channelStt(channel: AudioChannel): SttStream {
+  private channelStt(channel: AudioChannel): AnyStt {
     let stt = this.stt.get(channel);
     if (!stt) {
-      stt = new SttStream();
+      stt = createStt();
       const speaker = SPEAKER_BY_CHANNEL[channel];
       stt.on("partial", (text) => this.send({ type: "partial", speaker, text }));
       stt.on("committed", (text) => this.onCommitted(speaker, text));
@@ -168,7 +181,7 @@ export class Session {
 
     // Voice is optional: without an ElevenLabs key the answer still streams
     // as text, it just isn't spoken.
-    const tts = voiceProblem() ? null : new TtsSpeaker();
+    const tts = voiceProblem() ? null : createTts();
     this.currentSpeaker = tts;
 
     if (tts) {
