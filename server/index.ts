@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
-import { config } from "./config.ts";
+import { config, brainLabel, configProblems } from "./config.ts";
 import { Session } from "./session.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -57,5 +57,6 @@ setInterval(() => {
 server.listen(config.port, () => {
   console.log(`ThirdChair server on http://localhost:${config.port}`);
   console.log(`  wake phrase: "${config.wakePhrase}"`);
-  console.log(`  model: ${config.claudeModel} (effort: ${config.claudeEffort})`);
+  console.log(`  brain: ${brainLabel()}`);
+  for (const problem of configProblems()) console.warn(`  ⚠ ${problem}`);
 });

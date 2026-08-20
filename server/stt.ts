@@ -22,6 +22,8 @@ export class SttStream extends EventEmitter<SttEvents> {
   private ws: WebSocket | null = null;
   private closed = false;
   private queue: Buffer[] = [];
+  private reconnectDelay = 1000;
+  private lastError = "";
 
   start(): void {
     this.closed = false;
@@ -79,6 +81,9 @@ export class SttStream extends EventEmitter<SttEvents> {
         return;
       }
       switch (msg.message_type) {
+        case "session_started":
+          this.reconnectDelay = 1000;
+          break;
         case "partial_transcript":
           if (msg.text) this.emit("partial", msg.text);
           break;
@@ -87,14 +92,37 @@ export class SttStream extends EventEmitter<SttEvents> {
           if (msg.text?.trim()) this.emit("committed", msg.text.trim());
           break;
         default:
-          if (msg.error) this.emit("error", `STT: ${msg.error}`);
+          if (msg.error) this.fail(`STT: ${msg.error}`, msg.message_type);
       }
     });
 
-    ws.on("error", (err) => this.emit("error", `STT socket: ${err.message}`));
+    ws.on("error", (err) => this.fail(`STT socket: ${err.message}`));
 
     ws.on("close", () => {
-      if (!this.closed) setTimeout(() => this.connect(), 1000);
+      if (this.closed) return;
+      // Exponential backoff so a flapping connection doesn't hammer the API.
+      setTimeout(() => this.connect(), this.reconnectDelay);
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 15000);
     });
+  }
+
+  /**
+   * Report an error without spamming: identical messages are emitted once,
+   * and unrecoverable failures (bad key, out of quota) stop the stream
+   * entirely — retrying can never fix them.
+   */
+  private fail(message: string, messageType?: string): void {
+    const fatal =
+      messageType === "auth_error" ||
+      messageType === "quota_exceeded" ||
+      /authenticat|invalid_api_key|quota/i.test(message);
+    if (message !== this.lastError) {
+      this.lastError = message;
+      this.emit(
+        "error",
+        fatal ? `${message} (transcription stopped — fix the key and restart)` : message,
+      );
+    }
+    if (fatal) this.stop();
   }
 }

@@ -4,7 +4,7 @@ import { TranscriptStore } from "./transcript.ts";
 import { Trigger } from "./trigger.ts";
 import { answer, type AnswerHandle } from "./brain.ts";
 import { TtsSpeaker, SentenceChunker } from "./tts.ts";
-import { config } from "./config.ts";
+import { config, configProblems } from "./config.ts";
 import {
   CHANNEL_MIC,
   CHANNEL_TAB,
@@ -52,12 +52,18 @@ export class Session {
     ws.on("close", () => this.destroy());
 
     this.send({ type: "ready", wakePhrase: config.wakePhrase, state: this.state });
+    // Surface setup problems once, up front — not as a stream of
+    // connection failures after the user starts talking.
+    for (const message of configProblems()) this.send({ type: "error", message });
   }
 
   // ---- inbound ----------------------------------------------------------
 
   private onAudio(frame: Buffer): void {
     if (frame.length < 2 || this.state === "idle") return;
+    // Without a valid ElevenLabs key every connection is doomed —
+    // drop audio instead of opening sockets that can only fail.
+    if (!config.elevenLabsApiKey) return;
     const channel = frame[0] as AudioChannel;
     if (channel !== CHANNEL_MIC && channel !== CHANNEL_TAB) return;
     this.channelStt(channel).send(frame.subarray(1));
@@ -146,6 +152,11 @@ export class Session {
   // ---- answer pipeline ----------------------------------------------------
 
   private ask(question: string, speaker: Speaker): void {
+    const problems = configProblems();
+    if (problems.length > 0) {
+      for (const message of problems) this.send({ type: "error", message });
+      return;
+    }
     this.interrupt();
     this.send({ type: "triggered", question, speaker });
     this.setState("thinking");

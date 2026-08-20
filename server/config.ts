@@ -1,27 +1,67 @@
 import "dotenv/config";
 
-function required(name: string): string {
+export type BrainProvider = "claude" | "groq" | "ollama";
+
+/** Returns the env var, treating unset/placeholder values as missing. */
+function key(name: string): string | undefined {
   const v = process.env[name];
-  if (!v) {
-    console.error(
-      `Missing ${name}. Copy .env.example to .env and fill in your keys.`,
-    );
-    process.exit(1);
-  }
-  return v;
+  return !v || v.includes("placeholder") ? undefined : v;
+}
+
+const brain = (process.env.THIRDCHAIR_BRAIN ?? "claude") as BrainProvider;
+if (!["claude", "groq", "ollama"].includes(brain)) {
+  console.error(
+    `THIRDCHAIR_BRAIN must be "claude", "groq", or "ollama" (got "${brain}").`,
+  );
+  process.exit(1);
 }
 
 export const config = {
-  elevenLabsApiKey: required("ELEVENLABS_API_KEY"),
-  // The Anthropic SDK reads ANTHROPIC_API_KEY itself; we only check presence
-  // early so the failure is a clear startup error, not a mid-meeting one.
-  anthropicApiKey: required("ANTHROPIC_API_KEY"),
-  voiceId: process.env.ELEVENLABS_VOICE_ID ?? "21m00Tcm4TlvDq8ikWAM",
-  wakePhrase: process.env.WAKE_PHRASE ?? "hey copilot",
+  elevenLabsApiKey: key("ELEVENLABS_API_KEY"),
+  anthropicApiKey: key("ANTHROPIC_API_KEY"),
+  groqApiKey: key("GROQ_API_KEY"),
+  brain,
   claudeModel: process.env.THIRDCHAIR_MODEL ?? "claude-opus-5",
   claudeEffort: (process.env.THIRDCHAIR_EFFORT ?? "low") as
     | "low"
     | "medium"
     | "high",
+  groqModel: process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile",
+  ollamaUrl: process.env.OLLAMA_URL ?? "http://localhost:11434",
+  ollamaModel: process.env.OLLAMA_MODEL ?? "llama3.2",
+  voiceId: process.env.ELEVENLABS_VOICE_ID ?? "21m00Tcm4TlvDq8ikWAM",
+  wakePhrase: process.env.WAKE_PHRASE ?? "hey copilot",
   port: Number(process.env.PORT ?? 8787),
 };
+
+/** Human-readable setup problems; empty when fully configured. */
+export function configProblems(): string[] {
+  const problems: string[] = [];
+  if (!config.elevenLabsApiKey) {
+    problems.push(
+      "ELEVENLABS_API_KEY is not set — voice in/out is disabled. Free key at https://elevenlabs.io, then edit .env and restart.",
+    );
+  }
+  if (config.brain === "claude" && !config.anthropicApiKey) {
+    problems.push(
+      "ANTHROPIC_API_KEY is not set — answers are disabled. Get a key at https://console.anthropic.com, or run free: THIRDCHAIR_BRAIN=groq (free key at https://console.groq.com) or THIRDCHAIR_BRAIN=ollama (no key at all).",
+    );
+  }
+  if (config.brain === "groq" && !config.groqApiKey) {
+    problems.push(
+      "GROQ_API_KEY is not set — answers are disabled. Free key at https://console.groq.com/keys (no card needed), then edit .env and restart.",
+    );
+  }
+  return problems;
+}
+
+export function brainLabel(): string {
+  switch (config.brain) {
+    case "claude":
+      return `${config.claudeModel} (effort: ${config.claudeEffort})`;
+    case "groq":
+      return `groq/${config.groqModel}`;
+    case "ollama":
+      return `ollama/${config.ollamaModel} @ ${config.ollamaUrl}`;
+  }
+}

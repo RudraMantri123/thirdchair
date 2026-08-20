@@ -31,7 +31,7 @@ Every hop is a websocket and the audio stays raw PCM on both sides — no file e
 
 ## Quickstart
 
-You need an [ElevenLabs API key](https://elevenlabs.io/) and an [Anthropic API key](https://console.anthropic.com/).
+You need an [ElevenLabs API key](https://elevenlabs.io/) (free tier works) and a brain — [Anthropic](https://console.anthropic.com/) by default, or a **free** one (see below).
 
 ```bash
 git clone https://github.com/YOURNAME/thirdchair
@@ -52,6 +52,26 @@ npm run build
 npm start        # serves the built UI + websocket on :8787
 ```
 
+## Run it 100% free
+
+No key can be bundled with the repo — but the whole stack runs on free tiers:
+
+- **Voice (STT + TTS):** the ElevenLabs **free tier** includes enough credits for real testing — sign up and copy the key.
+- **Brain, option A — Groq (free tier, very fast):** grab a free key at [console.groq.com/keys](https://console.groq.com/keys) (no card), then in `.env`:
+
+  ```
+  THIRDCHAIR_BRAIN=groq
+  GROQ_API_KEY=gsk_...
+  ```
+
+- **Brain, option B — Ollama (no key at all, fully local):** install [Ollama](https://ollama.com), run `ollama pull llama3.2`, then in `.env`:
+
+  ```
+  THIRDCHAIR_BRAIN=ollama
+  ```
+
+Claude gives the best grounded answers; Groq is the best free-and-fast option; Ollama is the private/offline option. All three stream sentence-by-sentence into the same TTS pipeline.
+
 ## Using it in a real meeting
 
 1. Join your meeting in the browser as usual.
@@ -67,7 +87,11 @@ Everything is in `.env`:
 | Variable | Default | What it does |
 |---|---|---|
 | `ELEVENLABS_API_KEY` | — | STT (Scribe v2 Realtime) + TTS (Flash v2.5) |
-| `ANTHROPIC_API_KEY` | — | The answering brain |
+| `THIRDCHAIR_BRAIN` | `claude` | `claude`, `groq` (free tier), or `ollama` (free, local, keyless) |
+| `ANTHROPIC_API_KEY` | — | Required when brain is `claude` |
+| `GROQ_API_KEY` | — | Required when brain is `groq` (free at console.groq.com) |
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Any Groq-hosted model |
+| `OLLAMA_URL` / `OLLAMA_MODEL` | `localhost:11434` / `llama3.2` | Local Ollama endpoint and model |
 | `ELEVENLABS_VOICE_ID` | Rachel | Any voice from your ElevenLabs voice library |
 | `WAKE_PHRASE` | `hey copilot` | Whatever you want to call it |
 | `THIRDCHAIR_MODEL` | `claude-opus-5` | Claude model for answers |
