@@ -34,25 +34,30 @@ export const config = {
   port: Number(process.env.PORT ?? 8787),
 };
 
-/** Human-readable setup problems; empty when fully configured. */
-export function configProblems(): string[] {
-  const problems: string[] = [];
+/** Why voice (STT + TTS) can't run, or undefined if it can. */
+export function voiceProblem(): string | undefined {
   if (!config.elevenLabsApiKey) {
-    problems.push(
-      "ELEVENLABS_API_KEY is not set — voice in/out is disabled. Free key at https://elevenlabs.io, then edit .env and restart.",
-    );
+    return "ELEVENLABS_API_KEY is not set — voice in/out is disabled (answers will be text-only). Free key at https://elevenlabs.io, then edit .env and restart.";
   }
+  return undefined;
+}
+
+/** Why the answering brain can't run, or undefined if it can. */
+export function brainProblem(): string | undefined {
   if (config.brain === "claude" && !config.anthropicApiKey) {
-    problems.push(
-      "ANTHROPIC_API_KEY is not set — answers are disabled. Get a key at https://console.anthropic.com, or run free: THIRDCHAIR_BRAIN=groq (free key at https://console.groq.com) or THIRDCHAIR_BRAIN=ollama (no key at all).",
-    );
+    return "ANTHROPIC_API_KEY is not set — answers are disabled. Get a key at https://console.anthropic.com, or run free: THIRDCHAIR_BRAIN=groq (free key at https://console.groq.com) or THIRDCHAIR_BRAIN=ollama (no key at all).";
   }
   if (config.brain === "groq" && !config.groqApiKey) {
-    problems.push(
-      "GROQ_API_KEY is not set — answers are disabled. Free key at https://console.groq.com/keys (no card needed), then edit .env and restart.",
-    );
+    return "GROQ_API_KEY is not set — answers are disabled. Free key at https://console.groq.com/keys (no card needed), then edit .env and restart.";
   }
-  return problems;
+  return undefined;
+}
+
+/** Human-readable setup problems; empty when fully configured. */
+export function configProblems(): string[] {
+  return [voiceProblem(), brainProblem()].filter(
+    (p): p is string => p !== undefined,
+  );
 }
 
 export function brainLabel(): string {

@@ -4,7 +4,12 @@ import { TranscriptStore } from "./transcript.ts";
 import { Trigger } from "./trigger.ts";
 import { answer, type AnswerHandle } from "./brain.ts";
 import { TtsSpeaker, SentenceChunker } from "./tts.ts";
-import { config, configProblems } from "./config.ts";
+import {
+  config,
+  configProblems,
+  brainProblem,
+  voiceProblem,
+} from "./config.ts";
 import {
   CHANNEL_MIC,
   CHANNEL_TAB,
@@ -152,32 +157,36 @@ export class Session {
   // ---- answer pipeline ----------------------------------------------------
 
   private ask(question: string, speaker: Speaker): void {
-    const problems = configProblems();
-    if (problems.length > 0) {
-      for (const message of problems) this.send({ type: "error", message });
+    const noBrain = brainProblem();
+    if (noBrain) {
+      this.send({ type: "error", message: noBrain });
       return;
     }
     this.interrupt();
     this.send({ type: "triggered", question, speaker });
     this.setState("thinking");
 
-    const tts = new TtsSpeaker();
+    // Voice is optional: without an ElevenLabs key the answer still streams
+    // as text, it just isn't spoken.
+    const tts = voiceProblem() ? null : new TtsSpeaker();
     this.currentSpeaker = tts;
 
-    tts.on("audio", (pcm) => {
-      // First audio chunk is the thinking -> speaking transition.
-      if (this.state === "thinking") this.setState("speaking");
-      if (this.ws.readyState === this.ws.OPEN) this.ws.send(pcm);
-    });
-    tts.on("error", (message) => this.send({ type: "error", message }));
-    tts.on("done", () => {
-      if (this.currentSpeaker === tts) {
-        this.currentSpeaker = null;
-        this.settle();
-      }
-    });
+    if (tts) {
+      tts.on("audio", (pcm) => {
+        // First audio chunk is the thinking -> speaking transition.
+        if (this.state === "thinking") this.setState("speaking");
+        if (this.ws.readyState === this.ws.OPEN) this.ws.send(pcm);
+      });
+      tts.on("error", (message) => this.send({ type: "error", message }));
+      tts.on("done", () => {
+        if (this.currentSpeaker === tts) {
+          this.currentSpeaker = null;
+          this.settle();
+        }
+      });
+    }
 
-    const chunker = new SentenceChunker((sentence) => void tts.speak(sentence));
+    const chunker = new SentenceChunker((sentence) => void tts?.speak(sentence));
 
     const handle = answer(question, this.transcript.render(), (delta) => {
       chunker.push(delta);
@@ -188,17 +197,21 @@ export class Session {
     handle.done
       .then((text) => {
         chunker.flush();
-        void tts.end();
         this.send({ type: "answer_done", text });
+        if (tts) {
+          void tts.end();
+        } else {
+          this.settle();
+        }
       })
       .catch((err: unknown) => {
         if (this.currentAnswer !== handle) return; // superseded / barged in
-        tts.abort();
+        tts?.abort();
         this.currentSpeaker = null;
         this.settle();
         const message = err instanceof Error ? err.message : String(err);
         if (!/aborted/i.test(message)) {
-          this.send({ type: "error", message: `Claude: ${message}` });
+          this.send({ type: "error", message: `Brain: ${message}` });
         }
       });
   }
