@@ -124,6 +124,9 @@ function onServerMessage(msg: ServerMessage): void {
     case "transcript_export":
       downloadTranscript(msg.startedAt, msg.entries);
       break;
+    case "notice":
+      addLine("notice", `🎚 ${msg.message}`);
+      break;
     case "error":
       addLine("error", `⚠ ${msg.message}`);
       break;
@@ -180,6 +183,7 @@ btnStart.onclick = async () => {
     listening = true;
     btnStart.textContent = "Stop listening";
     btnTab.disabled = false;
+    reportInput();
   } else {
     capture.stop();
     send({ type: "stop" });
@@ -188,6 +192,38 @@ btnStart.onclick = async () => {
     btnTab.disabled = true;
   }
 };
+
+/**
+ * Report what the browser and OS actually handed us, and flag the input
+ * problems a user can fix. Worth surfacing because the same code can end up
+ * with a 48 kHz built-in mic with echo cancellation, or a Bluetooth headset
+ * running a heavily compressed 16 kHz voice link — and transcription quality
+ * differs sharply between them.
+ */
+function reportInput(): void {
+  const info = capture.inputInfo();
+  if (!info) return;
+  const s = info.settings;
+  const flags = [
+    s.echoCancellation ? "AEC" : "no AEC",
+    s.noiseSuppression ? "NS" : "no NS",
+    s.autoGainControl ? "AGC" : "no AGC",
+  ].join(", ");
+  addLine(
+    "event",
+    `🎙 Input: ${info.label || "default mic"} — capture ${info.rate} Hz, ${flags}`,
+  );
+
+  // A Bluetooth mic routes voice over a narrowband, heavily compressed link.
+  // It is usually the single biggest quality loss in the whole pipeline, and
+  // the fix (use the built-in mic) is one click away in Sound settings.
+  if (/airpod|bluetooth|headset|hands-?free|\bbt\b/i.test(info.label)) {
+    addLine(
+      "notice",
+      "🎚 That looks like a Bluetooth mic. Voice over Bluetooth is narrowband and compressed — the built-in mic will usually transcribe noticeably better.",
+    );
+  }
+}
 
 btnTab.onclick = async () => {
   const ok = await capture.addMeetingTab();

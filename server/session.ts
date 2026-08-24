@@ -130,6 +130,7 @@ export class Session {
       stt.on("partial", (text) => this.send({ type: "partial", speaker, text }));
       stt.on("committed", (text) => this.onCommitted(speaker, text));
       stt.on("error", (message) => this.send({ type: "error", message }));
+      stt.on("notice", (message) => this.send({ type: "notice", message }));
       stt.start();
       this.stt.set(channel, stt);
     }

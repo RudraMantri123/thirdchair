@@ -67,6 +67,8 @@ export type ServerMessage =
   // Client should drop any queued playback audio (barge-in).
   | { type: "speaking_cancel" }
   | { type: "transcript_export"; startedAt: number; entries: TranscriptEntry[] }
+  /** Actionable advice about input audio quality, not a failure. */
+  | { type: "notice"; message: string }
   | { type: "error"; message: string };
 
 export const MIC_SAMPLE_RATE = 16000;

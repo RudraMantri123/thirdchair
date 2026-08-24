@@ -34,10 +34,17 @@ let audioBytes = 0;
 ws.on("open", () => {
   ws.send(JSON.stringify({ type: "start" }));
   const FRAME = 4096; // 2048 samples = 128ms
+  // Real capture always carries a moment of room tone before the first word
+  // (the user clicks Start, then speaks). Send some, so the detector observes
+  // a noise floor instead of being handed speech on frame zero.
+  let lead = 8;
   let pos = 0;
   const timer = setInterval(() => {
     let chunk: Buffer;
-    if (pos < pcm.length) {
+    if (lead > 0) {
+      lead--;
+      chunk = Buffer.alloc(FRAME);
+    } else if (pos < pcm.length) {
       chunk = pcm.subarray(pos, pos + FRAME);
       pos += FRAME;
     } else {

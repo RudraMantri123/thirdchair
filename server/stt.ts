@@ -9,6 +9,8 @@ export interface SttEvents {
   partial: [text: string];
   committed: [text: string];
   error: [message: string];
+  /** Actionable input-quality advice (clipping, level too low). */
+  notice: [message: string];
 }
 
 /**

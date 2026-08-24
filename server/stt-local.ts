@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { config } from "./config.ts";
 import type { SttEvents } from "./stt.ts";
+import { AdaptiveVad } from "./audio/vad.ts";
 import { MIC_SAMPLE_RATE } from "../shared/protocol.ts";
 
 /**
@@ -18,13 +19,25 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
   private silenceMs = 0;
   private speechMs = 0;
   private lastError = "";
+  private vad = new AdaptiveVad();
   // Serialize whisper calls so utterances come back in spoken order.
   private inference: Promise<void> = Promise.resolve();
+  private clipped = 0;
+  private frames = 0;
+  private warnedClipping = false;
+  private warnedQuiet = false;
 
   private static readonly SILENCE_END_MS = 700;
   private static readonly MIN_SPEECH_MS = 250;
   private static readonly MAX_UTTERANCE_MS = 30000;
-  private static readonly PRE_ROLL_FRAMES = 3;
+  /**
+   * ~1 s of audio kept before speech is detected, so the utterance starts at
+   * the first syllable rather than wherever the detector happened to fire.
+   * Any energy-based VAD is late by construction, and a clipped wake phrase
+   * means a missed question. Pipecat and LiveKit both keep a 1 s ring here
+   * for the same reason; at 16 kHz mono it costs 32 kB.
+   */
+  private static readonly PRE_ROLL_FRAMES = 8;
 
   start(): void {
     this.closed = false;
@@ -40,7 +53,12 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
   send(pcm: Buffer): void {
     if (this.closed) return;
     const frameMs = (pcm.length / 2 / MIC_SAMPLE_RATE) * 1000;
-    const loud = rms(pcm) >= config.vadThreshold;
+    const level = rms(pcm);
+    // Gate on the margin above the room's measured noise floor, not on an
+    // absolute level: a headset and a laptop mic two metres away differ by
+    // ~30 dB, and office hum alone can exceed a quiet talker's level.
+    const loud = this.vad.push(level);
+    this.observeLevel(level, pcm);
 
     if (!this.inSpeech) {
       this.preRoll.push(pcm);
@@ -79,6 +97,43 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
       this.speechMs = 0;
       this.silenceMs = 0;
       if (hadSpeech) this.enqueue(Buffer.concat(chunks));
+    }
+  }
+
+  /**
+   * Watch the input for the two problems a user can actually fix: a mic hot
+   * enough to clip (which destroys consonants and no amount of downstream
+   * processing recovers), and a level so low that speech sits in the noise.
+   * Warned once each — a repeated nag during a meeting is worse than useless.
+   */
+  private observeLevel(level: number, pcm: Buffer): void {
+    this.frames++;
+    for (let i = 0; i < pcm.length; i += 2) {
+      if (Math.abs(pcm.readInt16LE(i)) >= 32700) {
+        this.clipped++;
+        break;
+      }
+    }
+    if (this.frames < 40) return; // ~5 s before judging anything
+
+    if (!this.warnedClipping && this.clipped / this.frames > 0.02) {
+      this.warnedClipping = true;
+      this.emit(
+        "notice",
+        "Your microphone is clipping — lower the input level or move back slightly. Clipped speech loses consonants and cannot be recovered later.",
+      );
+    }
+    if (
+      !this.warnedQuiet &&
+      this.frames > 200 &&
+      this.vad.noiseFloor > 0 &&
+      level < this.vad.noiseFloor * 1.4
+    ) {
+      this.warnedQuiet = true;
+      this.emit(
+        "notice",
+        "Speech is barely above the room noise. Move closer to the mic, or turn on macOS Voice Isolation (Control Centre → Mic Mode) for a large improvement.",
+      );
     }
   }
 
