@@ -55,9 +55,9 @@ export function voiceProblem(): string | undefined {
   if (config.voice === "elevenlabs" && !config.elevenLabsApiKey) {
     return "ELEVENLABS_API_KEY is not set — voice in/out is disabled (answers will be text-only). Free key at https://elevenlabs.io, or go fully local with THIRDCHAIR_VOICE=local (see README).";
   }
-  if (config.voice === "local" && process.platform !== "darwin") {
-    return "THIRDCHAIR_VOICE=local uses macOS `say` for speech output and currently only supports macOS. Use ELEVENLABS_API_KEY instead.";
-  }
+  // Deliberately not a platform check. Local voice works anywhere a speech
+  // engine and whisper-server exist; the engine is probed at first use and
+  // reports its own install hint, so a new platform needs no change here.
   return undefined;
 }
 

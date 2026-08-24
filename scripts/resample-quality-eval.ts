@@ -1,16 +1,23 @@
 /**
- * Does our capture-path resampler damage speech recognition?
+ * Does naive resampling in the capture path damage the signal?
  *
- * The OS hands us 48 kHz. The capture worklet decimates 3:1 to 16 kHz with
- * linear interpolation and NO anti-aliasing lowpass, so everything above
- * 8 kHz folds back into the speech band as distortion. This measures the
- * damage two ways:
+ * The OS hands us 48 kHz on most machines. An earlier version of the capture
+ * worklet decimated 3:1 to 16 kHz with linear interpolation and NO
+ * anti-aliasing lowpass, so everything above 8 kHz folded back into the
+ * speech band. This measures that two ways:
  *
- *   1. A pure 10 kHz tone. Correct 3:1 decimation removes it (it is above
- *      Nyquist). Unfiltered decimation folds it to |10000-16000| = 6000 Hz,
- *      so energy at 6 kHz is proof of aliasing.
- *   2. Real speech, transcribed by the same whisper-server the app uses,
- *      compared against a properly resampled reference (macOS `afconvert`).
+ *   1. A pure 10 kHz tone. Correct decimation removes it (above Nyquist);
+ *      unfiltered decimation folds it to |10000-16000| = 6000 Hz, so energy
+ *      at 6 kHz is direct proof of aliasing.
+ *   2. Real speech transcribed by the same whisper-server the app uses.
+ *
+ * The "fixed" path calls the SHIPPING resampler (server/audio/resample.ts)
+ * rather than a copy, so this eval keeps testing what actually runs.
+ *
+ * Honest result: the aliasing is unambiguous and large, but on synthesized
+ * speech it produced no measurable transcription difference — TTS voices are
+ * band-limited and have little above 8 kHz to alias. Treat the fix as
+ * correctness, not as a proven accuracy win.
  *
  * Run: npx tsx scripts/resample-quality-eval.ts
  */
@@ -18,132 +25,50 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { encodeWav } from "../server/audio/wav.ts";
+import { resamplePcm16 } from "../server/audio/resample.ts";
+import { testSpeech } from "./lib/test-speech.ts";
 
 const WHISPER = process.env.WHISPER_URL ?? "http://localhost:8788";
 const TMP = tmpdir();
+const SOURCE_RATE = 48000;
+const TARGET_RATE = 16000;
 
 const SENTENCE =
   "The enterprise tier costs fifty six dollars per seat and Priya ships the security fixes this Friday";
 
-// ---- WAV helpers ------------------------------------------------------------
-
-function readWavMono(path: string): { pcm: Float32Array; rate: number } {
-  const buf = readFileSync(path);
-  let offset = 12;
-  let rate = 0;
-  let bits = 16;
-  let channels = 1;
-  let data: Buffer | null = null;
-  while (offset + 8 <= buf.length) {
-    const id = buf.toString("ascii", offset, offset + 4);
-    const size = buf.readUInt32LE(offset + 4);
-    if (id === "fmt ") {
-      channels = buf.readUInt16LE(offset + 10);
-      rate = buf.readUInt32LE(offset + 12);
-      bits = buf.readUInt16LE(offset + 22);
-    } else if (id === "data") {
-      data = buf.subarray(offset + 8, Math.min(offset + 8 + size, buf.length));
-    }
-    offset += 8 + size + (size % 2);
-  }
-  if (!data || bits !== 16) throw new Error(`unsupported wav: ${path}`);
-  const n = Math.floor(data.length / 2 / channels);
-  const pcm = new Float32Array(n);
-  for (let i = 0; i < n; i++) pcm[i] = data.readInt16LE(i * 2 * channels) / 32768;
-  return { pcm, rate };
-}
-
-function writeWavMono(path: string, pcm: Float32Array, rate: number): void {
-  const header = Buffer.alloc(44);
-  const bytes = pcm.length * 2;
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + bytes, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(1, 22);
-  header.writeUInt32LE(rate, 24);
-  header.writeUInt32LE(rate * 2, 28);
-  header.writeUInt16LE(2, 32);
-  header.writeUInt16LE(16, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(bytes, 40);
-  const body = Buffer.alloc(bytes);
-  for (let i = 0; i < pcm.length; i++) {
-    body.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(pcm[i] * 32767))), i * 2);
-  }
-  writeFileSync(path, Buffer.concat([header, body]));
-}
-
-// ---- the two resamplers -----------------------------------------------------
-
-/** Exactly what capture-worklet.js does today: linear interp, no filter. */
-function linearDecimate(pcm: Float32Array, from: number, to: number): Float32Array {
+/** What the worklet used to do: linear interpolation, no filter. */
+function linearDecimate(pcm: Int16Array, from: number, to: number): Int16Array {
   const ratio = from / to;
-  const out = new Float32Array(Math.floor(pcm.length / ratio));
+  const out = new Int16Array(Math.floor(pcm.length / ratio));
   for (let i = 0; i < out.length; i++) {
     const pos = i * ratio;
     const idx = Math.floor(pos);
     const frac = pos - idx;
     const a = pcm[idx] ?? 0;
     const b = pcm[idx + 1] ?? 0;
-    out[i] = a + (b - a) * frac;
+    out[i] = Math.round(a + (b - a) * frac);
   }
   return out;
 }
 
-/** Windowed-sinc lowpass at 0.45*to, then decimate — the correct approach. */
-function filteredDecimate(pcm: Float32Array, from: number, to: number): Float32Array {
-  const ratio = from / to;
-  const cutoff = 0.45 / ratio; // normalized to the INPUT rate
-  const taps = 63;
-  const half = (taps - 1) / 2;
-  const h = new Float32Array(taps);
-  let sum = 0;
-  for (let i = 0; i < taps; i++) {
-    const n = i - half;
-    const sinc = n === 0 ? 2 * cutoff : Math.sin(2 * Math.PI * cutoff * n) / (Math.PI * n);
-    // Blackman window
-    const w =
-      0.42 -
-      0.5 * Math.cos((2 * Math.PI * i) / (taps - 1)) +
-      0.08 * Math.cos((4 * Math.PI * i) / (taps - 1));
-    h[i] = sinc * w;
-    sum += h[i];
-  }
-  for (let i = 0; i < taps; i++) h[i] /= sum;
-
-  const out = new Float32Array(Math.floor(pcm.length / ratio));
-  for (let i = 0; i < out.length; i++) {
-    const center = Math.round(i * ratio);
-    let acc = 0;
-    for (let k = 0; k < taps; k++) {
-      const idx = center + k - half;
-      if (idx >= 0 && idx < pcm.length) acc += pcm[idx] * h[k];
-    }
-    out[i] = acc;
-  }
-  return out;
-}
-
-// ---- measurement ------------------------------------------------------------
-
-/** Goertzel magnitude at one frequency — cheap single-bin DFT. */
-function magnitudeAt(pcm: Float32Array, freq: number, rate: number): number {
+/** Goertzel magnitude at one frequency — a cheap single-bin DFT. */
+function magnitudeAt(pcm: Int16Array, freq: number, rate: number): number {
   const w = (2 * Math.PI * freq) / rate;
   const coeff = 2 * Math.cos(w);
   let s1 = 0;
   let s2 = 0;
   for (let i = 0; i < pcm.length; i++) {
-    const s0 = pcm[i] + coeff * s1 - s2;
+    const s0 = pcm[i] / 32768 + coeff * s1 - s2;
     s2 = s1;
     s1 = s0;
   }
-  return Math.sqrt(s1 * s1 + s2 * s2 - coeff * s1 * s2) / pcm.length;
+  return Math.sqrt(Math.abs(s1 * s1 + s2 * s2 - coeff * s1 * s2)) / pcm.length;
 }
 
-async function transcribe(path: string): Promise<string> {
+async function transcribe(pcm: Int16Array): Promise<string> {
+  const path = join(TMP, `tc-rs-${Math.abs(pcm[100] ?? 0)}-${pcm.length}.wav`);
+  writeFileSync(path, encodeWav(pcm, TARGET_RATE));
   const form = new FormData();
   form.append("file", new Blob([new Uint8Array(readFileSync(path))]), "a.wav");
   form.append("response_format", "json");
@@ -152,7 +77,7 @@ async function transcribe(path: string): Promise<string> {
   return (j.text ?? "").replace(/\s+/g, " ").trim();
 }
 
-/** Word error rate against a reference, ignoring case and punctuation. */
+/** Word error rate, ignoring case and punctuation. */
 function wer(reference: string, got: string): number {
   const norm = (s: string) =>
     s.toLowerCase().replace(/[^a-z0-9 ]/g, "").split(/\s+/).filter(Boolean);
@@ -174,91 +99,54 @@ function wer(reference: string, got: string): number {
 }
 
 async function main() {
-  console.log("\n=== 1. Aliasing proof: a 10 kHz tone decimated 48k -> 16k ===\n");
-  const RATE = 48000;
-  const tone = new Float32Array(RATE);
+  console.log("\n=== 1. Aliasing: a 10 kHz tone decimated 48k -> 16k ===\n");
+  const tone = new Int16Array(SOURCE_RATE);
   for (let i = 0; i < tone.length; i++) {
-    tone[i] = 0.5 * Math.sin((2 * Math.PI * 10000 * i) / RATE);
+    tone[i] = Math.round(0.5 * 32767 * Math.sin((2 * Math.PI * 10000 * i) / SOURCE_RATE));
   }
-  // A 10 kHz tone is above the 8 kHz Nyquist of 16 kHz audio. Correct
-  // decimation removes it; unfiltered decimation folds it to 6 kHz.
-  for (const [name, fn] of [
-    ["linear (current)", linearDecimate],
-    ["filtered (fixed)", filteredDecimate],
+  for (const [name, out] of [
+    ["linear (old)", linearDecimate(tone, SOURCE_RATE, TARGET_RATE)],
+    ["filtered (shipping)", resamplePcm16(tone, SOURCE_RATE, TARGET_RATE)],
   ] as const) {
-    const out = fn(tone, RATE, 16000);
-    const alias = magnitudeAt(out, 6000, 16000);
-    const speech = magnitudeAt(out, 1000, 16000);
+    const alias = magnitudeAt(out, 6000, TARGET_RATE);
     console.log(
-      `  ${name.padEnd(18)} alias@6kHz = ${alias.toFixed(5)}  (${
+      `  ${name.padEnd(20)} alias@6kHz = ${alias.toFixed(5)}  (${
         alias > 0.01 ? "ALIASING PRESENT" : "clean"
       })`,
     );
-    void speech;
   }
 
-  console.log("\n=== 2. Speech: same audio, two resamplers, same STT ===\n");
-  const src48 = join(TMP, "tc-src48.wav");
-  execFileSync("say", ["-o", src48, "--data-format=LEI16@48000", SENTENCE]);
-  const { pcm, rate } = readWavMono(src48);
-  console.log(`  source: ${rate} Hz, ${(pcm.length / rate).toFixed(1)}s\n`);
+  console.log("\n=== 2. Speech through each resampler, same STT ===\n");
+  const src = await testSpeech(SENTENCE, SOURCE_RATE);
+  console.log(`  source: ${SOURCE_RATE} Hz, ${(src.length / SOURCE_RATE).toFixed(1)}s\n`);
 
-  const variants: { name: string; path: string }[] = [];
+  const variants: [string, Int16Array][] = [
+    ["linear interp (old)", linearDecimate(src, SOURCE_RATE, TARGET_RATE)],
+    ["filtered (shipping)", resamplePcm16(src, SOURCE_RATE, TARGET_RATE)],
+  ];
 
-  const lin = join(TMP, "tc-linear.wav");
-  writeWavMono(lin, linearDecimate(pcm, rate, 16000), 16000);
-  variants.push({ name: "linear interp (current)", path: lin });
-
-  const fil = join(TMP, "tc-filtered.wav");
-  writeWavMono(fil, filteredDecimate(pcm, rate, 16000), 16000);
-  variants.push({ name: "windowed-sinc (fixed)", path: fil });
-
-  // macOS's own high-quality resampler, as an independent reference.
-  const afc = join(TMP, "tc-afconvert.wav");
-  try {
-    execFileSync("afconvert", [
-      "-f", "WAVE", "-d", "LEI16@16000", "-q", "127", "--src-complexity", "bats",
-      src48, afc,
-    ]);
-    variants.push({ name: "afconvert (OS reference)", path: afc });
-  } catch {
-    console.log("  (afconvert unavailable, skipping OS reference)");
+  // macOS ships a high-quality resampler we can use as an independent
+  // reference. Skipped elsewhere — it is a cross-check, not a dependency.
+  if (process.platform === "darwin") {
+    try {
+      const a = join(TMP, "tc-af-src.wav");
+      const b = join(TMP, "tc-af-out.wav");
+      writeFileSync(a, encodeWav(src, SOURCE_RATE));
+      execFileSync("afconvert", [
+        "-f", "WAVE", "-d", `LEI16@${TARGET_RATE}`,
+        "-q", "127", "--src-complexity", "bats", a, b,
+      ]);
+      const { decodeWav } = await import("../server/audio/wav.ts");
+      variants.push(["afconvert (OS reference)", decodeWav(readFileSync(b)).pcm]);
+    } catch {
+      console.log("  (afconvert unavailable, skipping OS reference)");
+    }
   }
 
-  for (const v of variants) {
-    const text = await transcribe(v.path);
-    const rate = wer(SENTENCE, text);
-    console.log(`  ${v.name.padEnd(26)} WER ${(rate * 100).toFixed(1)}%`);
+  for (const [name, pcm] of variants) {
+    const text = await transcribe(pcm);
+    console.log(`  ${name.padEnd(26)} WER ${(wer(SENTENCE, text) * 100).toFixed(1)}%`);
     console.log(`    "${text}"`);
-  }
-
-  // Synthetic TTS is band-limited, so it has nothing above 8 kHz to alias.
-  // A real microphone in a real room does: sibilants reach past 10 kHz, and
-  // so do fan noise, keyboard clicks and chair scrapes. Add that content and
-  // the two resamplers stop being equivalent.
-  console.log("\n=== 3. Same speech + realistic high-frequency content ===\n");
-  for (const level of [0.02, 0.05, 0.1]) {
-    const noisy = new Float32Array(pcm.length);
-    // Tones spread over 9-21 kHz: all above the 8 kHz Nyquist of 16 kHz audio,
-    // so a correct resampler discards them and a naive one folds them inward.
-    const freqs = [9500, 11300, 13700, 15100, 17900, 20300];
-    for (let i = 0; i < pcm.length; i++) {
-      let hf = 0;
-      for (const f of freqs) hf += Math.sin((2 * Math.PI * f * i) / rate);
-      noisy[i] = pcm[i] + (hf / freqs.length) * level;
-    }
-    console.log(`  HF content at amplitude ${level}:`);
-    for (const [name, fn] of [
-      ["linear interp (current)", linearDecimate],
-      ["windowed-sinc (fixed)", filteredDecimate],
-    ] as const) {
-      const p = join(TMP, `tc-noisy-${name.slice(0, 6)}-${level}.wav`);
-      writeWavMono(p, fn(noisy, rate, 16000), 16000);
-      const text = await transcribe(p);
-      console.log(
-        `    ${name.padEnd(24)} WER ${(wer(SENTENCE, text) * 100).toFixed(1)}%  "${text.slice(0, 70)}"`,
-      );
-    }
   }
   console.log("");
 }

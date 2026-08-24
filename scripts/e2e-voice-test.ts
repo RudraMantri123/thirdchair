@@ -1,31 +1,10 @@
 // End-to-end voice-loop test: streams a synthesized spoken question into
 // ThirdChair's websocket as if it were mic audio, and reports every event.
 import WebSocket from "ws";
-import { readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { testSpeech } from "./lib/test-speech.ts";
 
-const WAV = "/tmp/e2e-question.wav";
-execFileSync("say", [
-  "-o",
-  WAV,
-  "--data-format=LEI16@16000",
-  "hey copilot, what is two plus two?",
-]);
-
-// Extract PCM from the WAV's data chunk
-const wav = readFileSync(WAV);
-let offset = 12;
-let pcm: Buffer | null = null;
-while (offset + 8 <= wav.length) {
-  const id = wav.toString("ascii", offset, offset + 4);
-  const size = wav.readUInt32LE(offset + 4);
-  if (id === "data") {
-    pcm = wav.subarray(offset + 8, offset + 8 + size);
-    break;
-  }
-  offset += 8 + size + (size % 2);
-}
-if (!pcm) throw new Error("no data chunk");
+const samples = await testSpeech("hey copilot, what is two plus two?", 16000);
+const pcm = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
 
 const ws = new WebSocket("ws://localhost:8787/ws");
 ws.binaryType = "nodebuffer";

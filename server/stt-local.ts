@@ -2,6 +2,8 @@ import { EventEmitter } from "node:events";
 import { config } from "./config.ts";
 import type { SttEvents } from "./stt.ts";
 import { AdaptiveVad } from "./audio/vad.ts";
+import { encodeWav } from "./audio/wav.ts";
+import { voiceEnhancementHint } from "./audio/speech.ts";
 import { MIC_SAMPLE_RATE } from "../shared/protocol.ts";
 
 /**
@@ -132,7 +134,7 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
       this.warnedQuiet = true;
       this.emit(
         "notice",
-        "Speech is barely above the room noise. Move closer to the mic, or turn on macOS Voice Isolation (Control Centre → Mic Mode) for a large improvement.",
+        `Speech is barely above the room noise. Move closer to the mic, or ${voiceEnhancementHint()} for a large improvement.`,
       );
     }
   }
@@ -146,7 +148,9 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
       const form = new FormData();
       form.append(
         "file",
-        new Blob([new Uint8Array(wavWrap(pcm))], { type: "audio/wav" }),
+        new Blob([new Uint8Array(encodeWav(pcm, MIC_SAMPLE_RATE))], {
+          type: "audio/wav",
+        }),
         "utterance.wav",
       );
       form.append("response_format", "json");
@@ -185,21 +189,3 @@ function rms(pcm: Buffer): number {
   return Math.sqrt(sum / samples);
 }
 
-/** Wrap raw 16 kHz mono s16le PCM in a minimal WAV container. */
-function wavWrap(pcm: Buffer): Buffer {
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + pcm.length, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20); // PCM
-  header.writeUInt16LE(1, 22); // mono
-  header.writeUInt32LE(MIC_SAMPLE_RATE, 24);
-  header.writeUInt32LE(MIC_SAMPLE_RATE * 2, 28);
-  header.writeUInt16LE(2, 32);
-  header.writeUInt16LE(16, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(pcm.length, 40);
-  return Buffer.concat([header, pcm]);
-}

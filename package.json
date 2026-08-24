@@ -11,7 +11,8 @@
     "build": "vite build web && tsc -p tsconfig.server.json --noEmit",
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.web.json --noEmit",
     "start": "tsx server/index.ts",
-    "voice:local": "whisper-server -m $HOME/.cache/whisper/ggml-base.en.bin --port 8788"
+    "voice:local": "tsx scripts/voice-local.ts",
+    "doctor": "tsx scripts/doctor.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

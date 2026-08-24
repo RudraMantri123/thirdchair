@@ -56,17 +56,63 @@ npm start        # serves the built UI + websocket on :8787
 
 No key can be bundled with the repo — but the whole stack runs free, two ways:
 
-### Zero keys at all (fully local, macOS)
+### Zero keys at all (fully local — macOS, Linux, Windows)
+
+Two pieces: whisper.cpp for listening, and whatever speech engine your OS
+already ships for talking.
+
+**1. Install whisper.cpp**
 
 ```bash
-brew install whisper-cpp
-# get the model (~150 MB): from Hugging Face…
-curl -L -o ~/.cache/whisper/ggml-base.en.bin --create-dirs \
+brew install whisper-cpp                      # macOS
+```
+On **Linux**, check your distro first, otherwise build it:
+```bash
+git clone https://github.com/ggerganov/whisper.cpp && cd whisper.cpp
+cmake -B build && cmake --build build -j --config Release
+# put build/bin on PATH, or set WHISPER_SERVER_BIN to the server binary
+```
+On **Windows**, download a release build from
+[whisper.cpp/releases](https://github.com/ggerganov/whisper.cpp/releases) and set
+`WHISPER_SERVER_BIN` to the extracted server executable.
+
+**2. Get the model** (~150 MB, same on every OS)
+
+```bash
+curl -L --create-dirs -o ~/.cache/whisper/ggml-base.en.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
-npm run voice:local        # starts whisper-server on :8788
 ```
 
-Then in `.env`: `THIRDCHAIR_VOICE=local` (this is already the default when no ElevenLabs key is set) plus a free brain (below). Listening runs on whisper.cpp (Metal-accelerated), speech output uses macOS's built-in synthesizer. Nothing leaves your machine.
+**3. Check and run**
+
+```bash
+npm run doctor        # says exactly what's missing, if anything
+npm run voice:local   # starts whisper-server on :8788
+```
+
+Then set `THIRDCHAIR_VOICE=local` in `.env` (already the default when no
+ElevenLabs key is present) plus a free brain (below). Nothing leaves your
+machine.
+
+**Speech output** uses the engine your OS already has, so there is usually
+nothing to install:
+
+| OS | Engine | Notes |
+|---|---|---|
+| macOS | `say` | Always present. Emits our target rate directly. |
+| Linux | `piper` › `espeak-ng` › `espeak` | `sudo apt install espeak-ng` for the quick option. For much better voices install [piper](https://github.com/rhasspy/piper) and set `PIPER_MODEL=/path/to/voice.onnx`. |
+| Windows | PowerShell `System.Speech` | Always present. |
+| anything | `THIRDCHAIR_TTS_CMD` | Escape hatch: any command taking `-w <out.wav> -f <text.txt>`. |
+
+Whatever the engine emits is normalized to mono 16-bit PCM at one rate by
+`server/audio/speech.ts`, so the rest of the pipeline never sees the
+difference. Text is always passed to these engines through a temp **file**,
+never interpolated into a shell or PowerShell command — meeting speech is
+untrusted input and must never be parsed as code.
+
+> Corporate network blocking Hugging Face? Fetch OpenAI's original weights from
+> their own CDN and convert them with whisper.cpp's
+> `models/convert-pt-to-ggml.py`.
 
 > Corporate network blocking Hugging Face? Download OpenAI's original weights from their own CDN and convert: `curl -O https://openaipublic.azureedge.net/main/whisper/models/25a8566e1d0c1e2231d1c762132cd20e0f96a85d16145c3a00adf5d1ac670ead/base.en.pt`, then run whisper.cpp's `models/convert-pt-to-ggml.py`.
 
@@ -160,25 +206,31 @@ Reproduce with `npx tsx scripts/vad-eval.ts` and
 
 **Where the OS is doing the heavy lifting**
 
-The single best noise-suppression available to this app is not in this app. On
-macOS, Core Audio's voice-processing path (the same `AUVoiceIO` unit native
-call apps use) provides echo cancellation, gain control and ML-based noise
-suppression *below* the browser. It surfaces to users as **Mic Mode** in
-Control Centre — Standard / **Voice Isolation** / Wide Spectrum — selectable
-per app while the mic is live.
+The single best noise suppression available to this app is not in this app.
+Every desktop OS ships voice processing below the browser, and it is better
+than anything reachable from inside a page:
+
+| OS | Feature | Where the user turns it on |
+|---|---|---|
+| macOS | Voice Isolation (Core Audio `AUVoiceIO`) | Control Centre → Mic Mode, while the mic is live |
+| Windows | Voice Focus / audio enhancements | Settings → System → Sound → the input device |
+| Linux | PipeWire/PulseAudio WebRTC echo-cancel | `pactl load-module module-echo-cancel`, then select that source |
+
+The app detects your platform and names the right one, rather than assuming
+macOS.
 
 This matters concretely: the one condition our detector still fails is a quiet
 talker in a room louder than they are (~4 dB SNR). No threshold fixes that,
-because the information isn't there. Voice Isolation fixes it by *removing the
-room*, which is why the app now points at it rather than pretending a better
-heuristic would do.
+because the information isn't in the signal. OS voice processing fixes it by
+*removing the room* — which is why the app points at it instead of pretending a
+better heuristic would do.
 
 Other places the OS decides quality for you:
 
-- **The device rate is not your choice.** Every input on this Mac reports 48
-  kHz (`system_profiler SPAudioDataType`), so *something* is always resampling
-  to 16 kHz. Better it be the platform than a hand-rolled loop on the audio
-  thread.
+- **The device rate is not your choice.** Consumer audio hardware runs at 44.1
+  or 48 kHz (every input on the Mac this was built on reports 48 kHz), so
+  *something* always resamples to the 16 kHz speech models want. Better the
+  platform's optimized resampler than a hand-rolled loop on the audio thread.
 - **Bluetooth is the biggest single quality loss.** When a headset's mic
   becomes active the link drops to a narrowband, heavily compressed voice
   profile — no amount of downstream processing recovers it. The app now
@@ -188,20 +240,23 @@ Other places the OS decides quality for you:
   helper could use the voice-processing unit directly, pick a specific
   `AudioDeviceID`, and set the IO buffer size.
 - **System audio capture is an OS capability, not a web one.** We use
-  `getDisplayMedia` and ask the user to tick "share tab audio", which is
-  clumsy and tab-scoped. Native macOS has proper answers: ScreenCaptureKit
-  (`SCStream` with audio, macOS 13+) and Core Audio process taps
-  (`AudioHardwareCreateProcessTap` / `CATapDescription`, macOS 14.2+) capture
-  per-process audio with no virtual driver like BlackHole. That is the right
-  way to hear a meeting, and it's on the roadmap.
-- **Permissions are the OS's, and they fail closed.** Microphone access and —
-  for any screen/system audio route — Screen Recording are separate TCC grants.
-  Denial looks like silence, not an error, so the app reports what it actually
-  received rather than assuming.
+  `getDisplayMedia` and ask the user to tick "share tab audio", which is clumsy
+  and tab-scoped — but it is the one route that works identically on all three
+  platforms, which is why it's what ships. Each OS has a better native answer:
+  macOS ScreenCaptureKit (`SCStream` audio, 13+) or Core Audio process taps
+  (`AudioHardwareCreateProcessTap`, 14.2+); Windows WASAPI loopback; Linux a
+  PipeWire monitor source. All capture per-app audio with no virtual driver
+  (BlackHole, VB-Cable). On the roadmap as an optional native helper.
+- **Permissions are the OS's, and they fail closed.** Mic access — and, for any
+  screen/system audio route, screen-recording permission — are separate grants
+  on macOS (TCC) and Windows, and a portal prompt under Wayland. Denial looks
+  like *silence*, not an error, which is why the app reports what it actually
+  received instead of assuming it got what it asked for.
 - **Long meetings fight power management.** An hour-long session can be cut
-  short by idle sleep, and background-tab throttling can starve timers. A
-  native build should hold an `IOPMAssertion` (what `caffeinate` wraps) for the
-  duration of a session.
+  short by idle sleep, and background-tab throttling starves timers. The
+  per-OS fix differs (`IOPMAssertion` / `caffeinate` on macOS,
+  `SetThreadExecutionState` on Windows, a `systemd-inhibit` lock on Linux), so
+  it belongs in a native helper rather than the page.
 - **The audio thread is real-time and unforgiving.** The AudioWorklet runs on a
   high-priority render thread where a missed deadline is a dropout, not a
   slowdown — which is the other reason resampling belongs to the platform's

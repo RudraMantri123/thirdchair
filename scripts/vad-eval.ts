@@ -14,39 +14,19 @@
  *
  * Run: npx tsx scripts/vad-eval.ts
  */
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { AdaptiveVad } from "../server/audio/vad.ts";
+import { testSpeech, toFloat } from "./lib/test-speech.ts";
 
 const RATE = 16000;
 const FRAME = 2048; // 128 ms, matching the capture worklet
 const FIXED_THRESHOLD = 600;
 
-function speechPcm(): Float32Array {
-  const path = join(tmpdir(), "tc-vad-src.wav");
-  execFileSync("say", [
-    "-o", path, `--data-format=LEI16@${RATE}`,
+const SPEECH = toFloat(
+  await testSpeech(
     "we agreed the enterprise tier lands at forty nine dollars a seat",
-  ]);
-  const buf = readFileSync(path);
-  let offset = 12;
-  let data: Buffer | null = null;
-  while (offset + 8 <= buf.length) {
-    const id = buf.toString("ascii", offset, offset + 4);
-    const size = buf.readUInt32LE(offset + 4);
-    if (id === "data") data = buf.subarray(offset + 8, offset + 8 + size);
-    offset += 8 + size + (size % 2);
-  }
-  if (!data) throw new Error("no data chunk");
-  const n = Math.floor(data.length / 2);
-  const pcm = new Float32Array(n);
-  for (let i = 0; i < n; i++) pcm[i] = data.readInt16LE(i * 2) / 32768;
-  return pcm;
-}
-
-const SPEECH = speechPcm();
+    RATE,
+  ),
+);
 
 /** Build: 2 s of noise floor, then speech scaled to `gain`, then 1 s noise. */
 function scenario(gain: number, noise: number): { pcm: Float32Array; speechStart: number } {

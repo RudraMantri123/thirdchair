@@ -1,28 +1,27 @@
 import { EventEmitter } from "node:events";
-import { execFile, type ChildProcess } from "node:child_process";
-import { readFile, unlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { TtsEvents } from "./tts.ts";
 import { TTS_SAMPLE_RATE } from "../shared/protocol.ts";
-
-let counter = 0;
+import { detectSpeechEngine, speechInstallHint } from "./audio/speech.ts";
 
 /**
- * Fully local speech synthesis using macOS's built-in `say`, emitting the
- * same 24 kHz Int16 PCM stream as the ElevenLabs speaker. Sentences are
- * synthesized sequentially so audio arrives in order.
+ * Fully local speech synthesis, emitting the same 24 kHz Int16 PCM stream as
+ * the ElevenLabs speaker so the client cannot tell them apart.
+ *
+ * The engine underneath is whatever this OS provides — `say` on macOS,
+ * piper/espeak-ng on Linux, System.Speech on Windows — normalized to a single
+ * rate by `audio/speech.ts`. Sentences are synthesized strictly in order,
+ * because they will be played in order.
  */
 export class LocalTtsSpeaker extends EventEmitter<TtsEvents> {
   private queue: string[] = [];
   private processing = false;
   private ended = false;
   private aborted = false;
-  private child: ChildProcess | null = null;
 
   async speak(sentence: string): Promise<void> {
     if (this.aborted) return;
-    this.queue.push(sentence.trim());
+    const trimmed = sentence.trim();
+    if (trimmed) this.queue.push(trimmed);
     void this.pump();
   }
 
@@ -35,53 +34,39 @@ export class LocalTtsSpeaker extends EventEmitter<TtsEvents> {
     this.aborted = true;
     this.queue = [];
     this.removeAllListeners("audio");
-    this.child?.kill();
   }
 
   private async pump(): Promise<void> {
     if (this.processing) return;
     this.processing = true;
+
+    const engine = await detectSpeechEngine();
+    if (!engine) {
+      this.processing = false;
+      this.emit("error", `No local speech engine. ${speechInstallHint()}`);
+      this.emit("done");
+      return;
+    }
+
     while (this.queue.length > 0 && !this.aborted) {
       const sentence = this.queue.shift()!;
-      const file = join(tmpdir(), `thirdchair-tts-${process.pid}-${counter++}.wav`);
       try {
-        await new Promise<void>((resolve, reject) => {
-          this.child = execFile(
-            "say",
-            ["-o", file, `--data-format=LEI16@${TTS_SAMPLE_RATE}`, sentence],
-            (err) => (err && !this.aborted ? reject(err) : resolve()),
-          );
-        });
-        if (!this.aborted) {
-          const pcm = wavData(await readFile(file));
-          if (pcm) this.emit("audio", pcm);
-        }
+        const pcm = await engine.speak(sentence, TTS_SAMPLE_RATE);
+        if (this.aborted) break;
+        this.emit(
+          "audio",
+          Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength),
+        );
       } catch (err) {
+        if (this.aborted) break;
         this.emit(
           "error",
-          `Local TTS: ${err instanceof Error ? err.message : String(err)}`,
+          `${engine.name}: ${err instanceof Error ? err.message : String(err)}`,
         );
-      } finally {
-        this.child = null;
-        void unlink(file).catch(() => {});
       }
     }
+
     this.processing = false;
     if (this.ended && !this.aborted) this.emit("done");
   }
-}
-
-/** Extract the `data` chunk payload from a RIFF/WAVE file (handles JUNK etc.). */
-function wavData(wav: Buffer): Buffer | null {
-  if (wav.length < 12 || wav.toString("ascii", 0, 4) !== "RIFF") return null;
-  let offset = 12;
-  while (offset + 8 <= wav.length) {
-    const id = wav.toString("ascii", offset, offset + 4);
-    const size = wav.readUInt32LE(offset + 4);
-    if (id === "data") {
-      return wav.subarray(offset + 8, Math.min(offset + 8 + size, wav.length));
-    }
-    offset += 8 + size + (size % 2);
-  }
-  return null;
 }
