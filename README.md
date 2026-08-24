@@ -137,6 +137,71 @@ shared/         websocket protocol types shared by both sides
 
 Latency budget per answer: STT commit (~150 ms after you stop) → Claude first sentence (streamed) → Flash TTS first audio (~75 ms model latency) → playback. In practice the voice starts within roughly a second of you finishing the question.
 
+### Memory: how an hour of speech becomes a prompt
+
+`server/memory/` is the part worth reading. It exists because the obvious
+implementation — keep a rolling transcript, slide a window over it, paste it
+into every prompt — is pathological, and measurably so:
+
+| | sliding window | append-only segments |
+|---|---|---|
+| mean prompt eval (local llama3, 50-min meeting) | 9,655 ms | **1,261 ms** |
+| worst case | 15,058 ms | **1,737 ms** |
+| fact recall over 60 minutes | 43% | **100%** |
+| stable-prefix reuse | 0.1% | **79–90%** |
+
+Reproduce with `npx tsx scripts/before-after-eval.ts`.
+
+The governing rule, derived from measurement rather than taste:
+
+> Prompt-eval cost is proportional to the number of tokens **after** the first
+> byte that differs from the cached prefix. So order prompt sections by how
+> often they change, ascending — and make everything early append-only.
+
+Which gives the layout `system → sealed segments → live tail → retrieved spans
+→ question`. Derived context sits next to the question, never in the system
+prompt, because a rewrite there costs only its own tokens.
+
+Concretely:
+
+- **Sealed segments.** Every ~40 utterances the tail is sealed at a speaker
+  boundary into an immutable segment. Its digest, its verbatim text and its
+  decisions are all rendered **once**, at seal time, and never recomputed. The
+  prompt is therefore one append-only stream of frozen chunks. This is why the
+  new system gets *faster* as a meeting grows while the old one fell off a
+  cliff at minute 25.
+- **Two profiles.** On Claude a 60-minute meeting is only ~20–35k tokens, so
+  nothing is compacted and recall is total. On a local 8k model, sealed
+  segments contribute an **extractive** digest — salient lines quoted verbatim
+  plus lookup hints. Extractive, not abstractive, because a summarizer LLM call
+  would evict the single prompt-cache slot and make the *next* spoken answer
+  pay a cold prompt eval. (Verified: two alternating prompt shapes both sit at
+  ~5.5 s forever, and `OLLAMA_NUM_PARALLEL=2` does not help.)
+- **A decision journal that never forgets or lies.** Decisions, actions and
+  blockers are extracted into a bi-temporal journal modeled on Graphiti. When
+  someone contradicts an earlier decision, the old claim is *not* deleted — its
+  validity window is closed and a new claim appended noting what it revises.
+  So "what did we decide about pricing?" gets the current answer, and "when did
+  that change?" still works. It also keeps rendered lines immutable, which is
+  what protects the cache.
+- **Retrieval without embeddings.** BM25 with mem0's query-length-adaptive
+  logistic normalization, combined with recency and importance, MMR for
+  diversity. An embedding round-trip on the answer path is latency this app
+  does not have.
+- **Everything on the answer path is arithmetic.** No LLM call, no embedding,
+  no I/O between question and first spoken word.
+
+Prior art this borrows from, with thanks: [Graphiti](https://github.com/getzep/graphiti)
+(bi-temporal edge invalidation, the deterministic dedup cascade),
+[mem0](https://github.com/mem0ai/mem0) (hybrid scoring, entity extraction, the
+NONE event), [Letta/MemGPT](https://github.com/letta-ai/letta) (memory tiers,
+off-path maintenance, approximate token counting),
+[langmem](https://github.com/langchain-ai/langmem) (append-only log with a
+derived view), [Haystack](https://github.com/deepset-ai/haystack) (two-fraction
+hysteresis, segment-as-atomic-unit), and [Pipecat](https://github.com/pipecat-ai/pipecat)
+/ [LiveKit Agents](https://github.com/livekit/agents) (record what was *spoken*,
+not what was generated).
+
 ### Design notes (patterns borrowed from Recall.ai)
 
 The architecture deliberately mirrors how [Recall.ai](https://docs.recall.ai/docs/real-time-websocket-endpoints) structures meeting bots:
