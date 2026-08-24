@@ -14,6 +14,20 @@
 
 const TAPS = 63;
 
+// Kernels are pure functions of the rate ratio, and a session uses one or two
+// ratios forever. Rebuilding 63 taps of sin/cos per call was pointless work on
+// every synthesized sentence.
+const kernelCache = new Map<number, Float32Array>();
+
+function kernelFor(ratio: number): Float32Array {
+  let k = kernelCache.get(ratio);
+  if (!k) {
+    k = buildKernel(ratio);
+    kernelCache.set(ratio, k);
+  }
+  return k;
+}
+
 function buildKernel(ratio: number): Float32Array {
   // Cutoff in cycles/sample of the INPUT signal: the lower of the two
   // Nyquist limits, with a little margin for the transition band.
@@ -49,7 +63,7 @@ export function resamplePcm16(
   if (from === to || pcm.length === 0) return pcm;
 
   const ratio = from / to;
-  const h = buildKernel(ratio);
+  const h = kernelFor(ratio);
   const half = (TAPS - 1) / 2;
   const outLength = Math.floor(pcm.length / ratio);
   const out = new Int16Array(outLength);

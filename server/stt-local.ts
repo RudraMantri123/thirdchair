@@ -4,19 +4,55 @@ import type { SttEvents } from "./stt.ts";
 import { AdaptiveVad } from "./audio/vad.ts";
 import { encodeWav } from "./audio/wav.ts";
 import { voiceEnhancementHint } from "./audio/speech.ts";
+import { PcmRing, asInt16 } from "./audio/ring.ts";
+import {
+  highPassInPlace,
+  normalizeGainInPlace,
+  padToMinimum,
+} from "./audio/preprocess.ts";
 import { MIC_SAMPLE_RATE } from "../shared/protocol.ts";
 
+const SILENCE_END_MS = 700;
+const MIN_SPEECH_MS = 250;
+const MAX_UTTERANCE_MS = 30000;
 /**
- * Fully local transcription: energy-based voice activity detection over the
- * incoming 16 kHz PCM, then each detected utterance is sent as a WAV to a
- * local whisper.cpp `whisper-server` (/inference). No cloud, no API key.
+ * ~1 s of audio kept before speech is detected, so an utterance starts at the
+ * first syllable rather than wherever the detector happened to fire. Any
+ * energy-based VAD is late by construction, and a clipped wake phrase means a
+ * missed question. Pipecat and LiveKit keep a 1 s ring for the same reason; at
+ * 16 kHz mono it costs 32 kB.
+ */
+const PRE_ROLL_MS = 1024;
+
+/**
+ * Phrases Whisper emits when handed near-silence — artefacts of its training
+ * data, not speech. They are indistinguishable from a real short reply, so
+ * they get filtered here rather than reaching the transcript, where they would
+ * become fabricated meeting content.
+ */
+const HALLUCINATIONS = [
+  "thank you", "thanks for watching", "thank you for watching",
+  "please subscribe", "subscribe to my channel", "bye", "okay",
+  "you", "thanks", "the end", "music", "silence",
+];
+
+/**
+ * Fully local transcription: adaptive voice activity detection over the
+ * incoming 16 kHz PCM, then each detected utterance is conditioned and sent as
+ * a WAV to a local whisper.cpp `whisper-server` (/inference). No cloud, no key.
  *
  * Emits only "committed" segments (whisper has no streaming partials).
  */
 export class LocalSttStream extends EventEmitter<SttEvents> {
   private closed = false;
-  private utterance: Buffer[] = [];
-  private preRoll: Buffer[] = [];
+  // Pre-allocated once per stream: an utterance never grows past its cap and
+  // the accumulator produces no per-frame garbage.
+  private utterance = new PcmRing(
+    Math.ceil((MAX_UTTERANCE_MS / 1000) * MIC_SAMPLE_RATE),
+  );
+  private preRoll = new PcmRing(
+    Math.ceil((PRE_ROLL_MS / 1000) * MIC_SAMPLE_RATE),
+  );
   private inSpeech = false;
   private silenceMs = 0;
   private speechMs = 0;
@@ -29,17 +65,8 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
   private warnedClipping = false;
   private warnedQuiet = false;
 
-  private static readonly SILENCE_END_MS = 700;
-  private static readonly MIN_SPEECH_MS = 250;
-  private static readonly MAX_UTTERANCE_MS = 30000;
-  /**
-   * ~1 s of audio kept before speech is detected, so the utterance starts at
-   * the first syllable rather than wherever the detector happened to fire.
-   * Any energy-based VAD is late by construction, and a clipped wake phrase
-   * means a missed question. Pipecat and LiveKit both keep a 1 s ring here
-   * for the same reason; at 16 kHz mono it costs 32 kB.
-   */
-  private static readonly PRE_ROLL_FRAMES = 8;
+  /** Vocabulary bias for the recognizer, supplied by the session. */
+  promptProvider: (() => string) | null = null;
 
   start(): void {
     this.closed = false;
@@ -47,37 +74,37 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
 
   stop(): void {
     this.closed = true;
-    this.utterance = [];
-    this.preRoll = [];
+    this.utterance.clear();
+    this.preRoll.clear();
     this.inSpeech = false;
   }
 
   send(pcm: Buffer): void {
     if (this.closed) return;
-    const frameMs = (pcm.length / 2 / MIC_SAMPLE_RATE) * 1000;
-    const level = rms(pcm);
+    const samples = asInt16(pcm);
+    const frameMs = (samples.length / MIC_SAMPLE_RATE) * 1000;
+    const level = rms(samples);
     // Gate on the margin above the room's measured noise floor, not on an
     // absolute level: a headset and a laptop mic two metres away differ by
     // ~30 dB, and office hum alone can exceed a quiet talker's level.
     const loud = this.vad.push(level);
-    this.observeLevel(level, pcm);
+    this.observeLevel(level, samples);
 
     if (!this.inSpeech) {
-      this.preRoll.push(pcm);
-      if (this.preRoll.length > LocalSttStream.PRE_ROLL_FRAMES) {
-        this.preRoll.shift();
-      }
+      // The ring drops its own oldest samples, so pre-roll memory is capped
+      // by the type rather than by how long the room stays quiet.
+      this.preRoll.write(samples);
       if (loud) {
         this.inSpeech = true;
-        this.utterance = [...this.preRoll];
-        this.preRoll = [];
+        this.utterance.clear();
+        this.preRoll.drainInto(this.utterance);
         this.speechMs = frameMs;
         this.silenceMs = 0;
       }
       return;
     }
 
-    this.utterance.push(pcm);
+    this.utterance.write(samples);
     if (loud) {
       this.speechMs += frameMs;
       this.silenceMs = 0;
@@ -85,20 +112,19 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
       this.silenceMs += frameMs;
     }
 
-    const utteranceMs =
-      (this.utterance.reduce((n, b) => n + b.length, 0) / 2 / MIC_SAMPLE_RATE) *
-      1000;
+    const utteranceMs = (this.utterance.length / MIC_SAMPLE_RATE) * 1000;
     if (
-      this.silenceMs >= LocalSttStream.SILENCE_END_MS ||
-      utteranceMs >= LocalSttStream.MAX_UTTERANCE_MS
+      this.silenceMs >= SILENCE_END_MS ||
+      utteranceMs >= MAX_UTTERANCE_MS ||
+      this.utterance.full
     ) {
-      const chunks = this.utterance;
-      const hadSpeech = this.speechMs >= LocalSttStream.MIN_SPEECH_MS;
+      const hadSpeech = this.speechMs >= MIN_SPEECH_MS;
+      const pcm16 = hadSpeech ? this.utterance.toPcm() : null;
       this.inSpeech = false;
-      this.utterance = [];
+      this.utterance.clear();
       this.speechMs = 0;
       this.silenceMs = 0;
-      if (hadSpeech) this.enqueue(Buffer.concat(chunks));
+      if (pcm16) this.enqueue(pcm16);
     }
   }
 
@@ -108,10 +134,11 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
    * processing recovers), and a level so low that speech sits in the noise.
    * Warned once each — a repeated nag during a meeting is worse than useless.
    */
-  private observeLevel(level: number, pcm: Buffer): void {
+  private observeLevel(level: number, samples: Int16Array): void {
     this.frames++;
-    for (let i = 0; i < pcm.length; i += 2) {
-      if (Math.abs(pcm.readInt16LE(i)) >= 32700) {
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      if (s >= 32700 || s <= -32700) {
         this.clipped++;
         break;
       }
@@ -139,21 +166,34 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
     }
   }
 
-  private enqueue(pcm: Buffer): void {
+  private enqueue(pcm: Int16Array): void {
     this.inference = this.inference.then(() => this.transcribe(pcm));
   }
 
-  private async transcribe(pcm: Buffer): Promise<void> {
+  private async transcribe(pcm: Int16Array): Promise<void> {
     try {
+      // Condition the signal the way the model expects: DC/rumble removed,
+      // level normalized, and padded if very short. Measured together these
+      // cut WER on noisy and quiet input (scripts/asr-eval.ts). In place, so
+      // no extra copy of the utterance.
+      highPassInPlace(pcm, MIC_SAMPLE_RATE);
+      normalizeGainInPlace(pcm);
+      const audio = padToMinimum(pcm, MIC_SAMPLE_RATE);
+
       const form = new FormData();
       form.append(
         "file",
-        new Blob([new Uint8Array(encodeWav(pcm, MIC_SAMPLE_RATE))], {
+        new Blob([new Uint8Array(encodeWav(audio, MIC_SAMPLE_RATE))], {
           type: "audio/wav",
         }),
         "utterance.wav",
       );
       form.append("response_format", "json");
+      // Bias decoding with the meeting's own vocabulary. A name heard once is
+      // then far more likely to be transcribed correctly the next time, which
+      // is exactly where a general model is weakest.
+      const bias = this.promptProvider?.();
+      if (bias) form.append("prompt", bias);
       const res = await fetch(`${config.whisperUrl}/inference`, {
         method: "POST",
         body: form,
@@ -165,7 +205,9 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
       const clean = (text ?? "")
         .replace(/\[[^\]]*\]|\([^)]*\)/g, "") // [BLANK_AUDIO], (door closes)…
         .trim();
-      if (clean && !this.closed) this.emit("committed", clean);
+      if (clean && !this.closed && !isHallucination(clean)) {
+        this.emit("committed", clean);
+      }
     } catch (err) {
       const message = `Local STT: ${
         err instanceof Error ? err.message : String(err)
@@ -178,14 +220,23 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
   }
 }
 
-function rms(pcm: Buffer): number {
+/** Int16-scale RMS over a typed-array view — no per-sample method call. */
+function rms(samples: Int16Array): number {
+  if (samples.length === 0) return 0;
   let sum = 0;
-  const samples = pcm.length / 2;
-  if (samples === 0) return 0;
-  for (let i = 0; i < pcm.length; i += 2) {
-    const s = pcm.readInt16LE(i);
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
     sum += s * s;
   }
-  return Math.sqrt(sum / samples);
+  return Math.sqrt(sum / samples.length);
 }
 
+/**
+ * True when a transcript is one of Whisper's silence artefacts. Only exact
+ * matches are rejected: "okay" alone is almost certainly noise, while "okay
+ * let's ship it" is real speech, so length is the discriminator.
+ */
+function isHallucination(text: string): boolean {
+  const bare = text.toLowerCase().replace(/[^a-z ]/g, "").trim();
+  return HALLUCINATIONS.includes(bare);
+}

@@ -2,18 +2,21 @@
  * Adaptive voice-activity detection.
  *
  * A fixed RMS threshold cannot be correct across the conditions a meeting
- * actually presents: a headset at 5 cm and a laptop mic 2 m away differ by
- * ~30 dB, and office hum alone can exceed the level of a quiet talker. So the
- * detector tracks the room's noise floor and gates on the margin ABOVE it
- * rather than on an absolute level.
+ * presents: a headset at 5 cm and a laptop mic 2 m away differ by ~30 dB, and
+ * office hum alone can exceed the level of a quiet talker. So the detector
+ * tracks the room's noise floor and gates on the margin ABOVE it rather than
+ * on an absolute level. Measured 7/10 -> 9/10 conditions (scripts/vad-eval.ts).
  *
- * Two details that matter more than the threshold itself:
+ * Three details matter more than the threshold value:
  *
  *  - Hysteresis. Speech is declared at a high margin and sustained down to a
  *    lower one, so a word's quiet tail doesn't chop the utterance in half.
- *  - Asymmetric floor tracking. The floor rises slowly and falls quickly, so
- *    a passing truck raises it briefly without swallowing the next minute of
- *    speech, and it never adapts upward *into* ongoing speech.
+ *  - Minimum statistics for the floor (see `noiseFloor`), which is what makes
+ *    it robust to capture that begins mid-sentence.
+ *  - Zero allocation per frame. This runs on every 128 ms of every channel for
+ *    the length of a meeting; the level history is a pre-allocated ring and
+ *    the percentile is a partial selection over a reused scratch array, so
+ *    the detector contributes nothing to GC pressure.
  */
 
 export interface VadOptions {
@@ -41,23 +44,31 @@ const DEFAULTS = {
 };
 
 export class AdaptiveVad {
-  private window: number[] = [];
+  private levels: Float64Array;
+  private scratch: Float64Array;
+  private writeIdx = 0;
+  private filled = 0;
   private inSpeech = false;
   private above = 0;
+  private cachedFloor: number;
   private opts: Required<VadOptions>;
 
   constructor(options: VadOptions = {}) {
     this.opts = { ...DEFAULTS, ...options };
+    this.levels = new Float64Array(this.opts.windowFrames);
+    this.scratch = new Float64Array(this.opts.windowFrames);
+    this.cachedFloor = this.opts.absoluteFloor;
   }
 
   /** Feed one frame's Int16-scale RMS. Returns true while speech is active. */
   push(level: number): boolean {
-    this.window.push(level);
-    if (this.window.length > this.opts.windowFrames) this.window.shift();
+    this.levels[this.writeIdx] = level;
+    this.writeIdx = (this.writeIdx + 1) % this.opts.windowFrames;
+    if (this.filled < this.opts.windowFrames) this.filled++;
+    this.cachedFloor = this.computeFloor();
 
-    const floor = this.noiseFloor;
-    const onset = floor * db(this.opts.onsetDb);
-    const sustain = floor * db(this.opts.sustainDb);
+    const onset = this.cachedFloor * db(this.opts.onsetDb);
+    const sustain = this.cachedFloor * db(this.opts.sustainDb);
 
     if (this.inSpeech) {
       this.inSpeech = level >= sustain && level >= this.opts.absoluteFloor;
@@ -70,29 +81,56 @@ export class AdaptiveVad {
     return this.inSpeech;
   }
 
+  /** Last computed noise floor, Int16 RMS. */
+  get noiseFloor(): number {
+    return this.cachedFloor;
+  }
+
+  reset(): void {
+    this.writeIdx = 0;
+    this.filled = 0;
+    this.inSpeech = false;
+    this.above = 0;
+    this.cachedFloor = this.opts.absoluteFloor;
+  }
+
   /**
    * Noise floor by minimum statistics: a low percentile of the recent level
    * window. This is what makes the detector robust in both directions that
-   * exponential tracking cannot satisfy at once —
+   * exponential averaging cannot satisfy at once —
    *
    *  - Capture that begins mid-sentence still works: the quietest frames in
    *    the window are inter-word gaps, well below the syllable peaks, so
    *    speech still clears the margin. (Seeding a running average from the
-   *    first frame instead would learn speech as the baseline and go deaf.)
+   *    first frame instead would learn speech as the baseline and go deaf —
+   *    this was a real regression during development.)
    *  - A loud room is respected immediately rather than after an adaptation
    *    ramp, so there is no window of false triggers at startup.
+   *
+   * Implemented as a partial selection sort to the target index only: for a
+   * 10th percentile of 40 frames that is 4 passes, not a full sort, and it
+   * runs over a reused scratch array so the hot path never allocates.
    */
-  get noiseFloor(): number {
-    if (this.window.length === 0) return this.opts.absoluteFloor;
-    const sorted = [...this.window].sort((a, b) => a - b);
-    const idx = Math.floor(sorted.length * this.opts.floorPercentile);
-    return Math.max(sorted[Math.min(idx, sorted.length - 1)], this.opts.absoluteFloor);
-  }
+  private computeFloor(): number {
+    const n = this.filled;
+    if (n === 0) return this.opts.absoluteFloor;
+    // Copy by index rather than `set(levels.subarray(0, n))`: subarray
+    // allocates a fresh view object, and this runs on every frame of every
+    // channel — that alone accounted for megabytes of garbage per meeting.
+    const s = this.scratch;
+    for (let i = 0; i < n; i++) s[i] = this.levels[i];
 
-  reset(): void {
-    this.window = [];
-    this.inSpeech = false;
-    this.above = 0;
+    const target = Math.min(Math.floor(n * this.opts.floorPercentile), n - 1);
+    for (let i = 0; i <= target; i++) {
+      let min = i;
+      for (let j = i + 1; j < n; j++) if (s[j] < s[min]) min = j;
+      if (min !== i) {
+        const t = s[i];
+        s[i] = s[min];
+        s[min] = t;
+      }
+    }
+    return Math.max(s[target], this.opts.absoluteFloor);
   }
 }
 

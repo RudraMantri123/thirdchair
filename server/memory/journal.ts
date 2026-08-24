@@ -49,11 +49,16 @@ export class DecisionJournal {
    * Offer an utterance to the journal. Returns the appended claim, or null
    * when the line carries no durable decision/action/blocker signal.
    */
-  offer(text: string, speaker: Speaker, validAt: number): Claim | null {
+  offer(
+    text: string,
+    speaker: Speaker,
+    validAt: number,
+    entities?: string[],
+  ): Claim | null {
     const kind = classify(text);
     if (kind === null) return null;
 
-    const subject = this.subjectOf(text);
+    const subject = this.subjectOf(text, entities);
     if (!subject) return null;
 
     const key = `${kind}:${subject}`;
@@ -133,8 +138,8 @@ export class DecisionJournal {
    * "the Pro tier" / "Pro plan" / "pro-tier" collapse to one key and
    * contradiction detection is a hash lookup rather than a search.
    */
-  private subjectOf(text: string): string {
-    const entities = extractEntities(text);
+  private subjectOf(text: string, precomputed?: string[]): string {
+    const entities = precomputed ?? extractEntities(text);
     if (entities.length === 0) return "";
     // Prefer the longest entity — the most specific description available.
     const best = entities.reduce((a, b) => (b.length > a.length ? b : a));
