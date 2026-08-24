@@ -137,6 +137,82 @@ shared/         websocket protocol types shared by both sides
 
 Latency budget per answer: STT commit (~150 ms after you stop) → Claude first sentence (streamed) → Flash TTS first audio (~75 ms model latency) → playback. In practice the voice starts within roughly a second of you finishing the question.
 
+### Input audio: what we control, and what only the OS can
+
+Transcription quality is decided before a single byte reaches the model. The
+capture path is short but every stage can quietly ruin the signal, and several
+of the biggest levers are not ours at all — they belong to the operating
+system.
+
+**What the pipeline does now**
+
+| Stage | Choice | Why |
+|---|---|---|
+| Sample rate | `AudioContext({sampleRate: 16000})` | Delegates resampling from the device's native 48 kHz to the browser's own resampler. We previously decimated 3:1 with linear interpolation and **no lowpass** — a 10 kHz tone folded back to 6 kHz at *half* its amplitude. Never decimate without filtering. |
+| Fallback | windowed-sinc in the worklet | Safari/Firefox may refuse a 16 kHz context. Falling back to "no resampling" would emit 48 kHz audio labelled 16 kHz — 3× too fast and unintelligible. |
+| Voice detection | noise-floor-relative, minimum statistics | A fixed threshold both misses soft talkers and false-triggers in a loud room. Measured 7/10 → 9/10 across simulated conditions. |
+| Pre-roll | 1 s ring per channel | Energy VAD is late by construction; without it the wake phrase gets clipped and the question is lost. 32 kB. |
+| Int16 cast | clamp before scaling | An out-of-range float wraps on cast, turning a loud peak into full-scale noise of the *opposite sign*. |
+| Feedback | one-shot notices | Clipping and too-low level are user-fixable, so we say so — once, not as a nag. |
+
+Reproduce with `npx tsx scripts/vad-eval.ts` and
+`npx tsx scripts/resample-quality-eval.ts`.
+
+**Where the OS is doing the heavy lifting**
+
+The single best noise-suppression available to this app is not in this app. On
+macOS, Core Audio's voice-processing path (the same `AUVoiceIO` unit native
+call apps use) provides echo cancellation, gain control and ML-based noise
+suppression *below* the browser. It surfaces to users as **Mic Mode** in
+Control Centre — Standard / **Voice Isolation** / Wide Spectrum — selectable
+per app while the mic is live.
+
+This matters concretely: the one condition our detector still fails is a quiet
+talker in a room louder than they are (~4 dB SNR). No threshold fixes that,
+because the information isn't there. Voice Isolation fixes it by *removing the
+room*, which is why the app now points at it rather than pretending a better
+heuristic would do.
+
+Other places the OS decides quality for you:
+
+- **The device rate is not your choice.** Every input on this Mac reports 48
+  kHz (`system_profiler SPAudioDataType`), so *something* is always resampling
+  to 16 kHz. Better it be the platform than a hand-rolled loop on the audio
+  thread.
+- **Bluetooth is the biggest single quality loss.** When a headset's mic
+  becomes active the link drops to a narrowband, heavily compressed voice
+  profile — no amount of downstream processing recovers it. The app now
+  detects this and says so; the fix is choosing the built-in mic.
+- **The browser sandbox caps what a web app can reach.** From a page you get
+  WebRTC's AEC/NS/AGC via `getUserMedia` constraints and nothing more. A native
+  helper could use the voice-processing unit directly, pick a specific
+  `AudioDeviceID`, and set the IO buffer size.
+- **System audio capture is an OS capability, not a web one.** We use
+  `getDisplayMedia` and ask the user to tick "share tab audio", which is
+  clumsy and tab-scoped. Native macOS has proper answers: ScreenCaptureKit
+  (`SCStream` with audio, macOS 13+) and Core Audio process taps
+  (`AudioHardwareCreateProcessTap` / `CATapDescription`, macOS 14.2+) capture
+  per-process audio with no virtual driver like BlackHole. That is the right
+  way to hear a meeting, and it's on the roadmap.
+- **Permissions are the OS's, and they fail closed.** Microphone access and —
+  for any screen/system audio route — Screen Recording are separate TCC grants.
+  Denial looks like silence, not an error, so the app reports what it actually
+  received rather than assuming.
+- **Long meetings fight power management.** An hour-long session can be cut
+  short by idle sleep, and background-tab throttling can starve timers. A
+  native build should hold an `IOPMAssertion` (what `caffeinate` wraps) for the
+  duration of a session.
+- **The audio thread is real-time and unforgiving.** The AudioWorklet runs on a
+  high-priority render thread where a missed deadline is a dropout, not a
+  slowdown — which is the other reason resampling belongs to the platform's
+  optimized code rather than to a JS loop in `process()`.
+
+**If you want the best possible input today**, in order of effect: use a wired
+or built-in mic rather than Bluetooth; turn on Voice Isolation in Control
+Centre; get within about arm's length of the mic; and share the meeting tab's
+audio so remote participants are captured directly instead of through your
+speakers and back into your mic.
+
 ### Memory: how an hour of speech becomes a prompt
 
 `server/memory/` is the part worth reading. It exists because the obvious
@@ -214,6 +290,11 @@ The architecture deliberately mirrors how [Recall.ai](https://docs.recall.ai/doc
 
 ## Roadmap
 
+- [ ] Native macOS capture helper: ScreenCaptureKit / Core Audio process taps
+      for per-app meeting audio, the voice-processing unit for OS-grade AEC and
+      noise suppression, and an `IOPMAssertion` so a long meeting can't be cut
+      short by idle sleep
+- [ ] A real VAD model (Silero) for the low-SNR case energy detection can't win
 - [ ] Headless bot mode: join Meet/Zoom as a participant (Recall.ai or livekit)
 - [ ] Tool use: let it check your calendar / docs / tickets before answering
 - [ ] Per-speaker diarization in the transcript
