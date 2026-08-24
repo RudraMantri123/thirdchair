@@ -2,7 +2,15 @@ import type { Speaker, TranscriptEntry } from "../shared/protocol.ts";
 
 const MAX_ENTRIES = 5000;
 
-/** Rolling, speaker-attributed transcript of everything heard this session. */
+/**
+ * LEGACY — superseded by `memory/index.ts` (MeetingMemory) and no longer used
+ * by the server. Kept only as the baseline in `scripts/before-after-eval.ts`:
+ * its sliding char window is the behaviour the new subsystem is measured
+ * against, so deleting it would remove the ability to reproduce the
+ * comparison.
+ *
+ * Rolling, speaker-attributed transcript of everything heard this session.
+ */
 export class TranscriptStore {
   private entries: TranscriptEntry[] = [];
   readonly startedAt = Date.now();

@@ -38,6 +38,13 @@ export const config = {
   groqModel: process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile",
   ollamaUrl: process.env.OLLAMA_URL ?? "http://localhost:11434",
   ollamaModel: process.env.OLLAMA_MODEL ?? "llama3.2",
+  // Ollama defaults to 4096 and silently truncates the prompt from the FRONT,
+  // so the model answers confidently about a meeting whose start it never saw.
+  ollamaNumCtx: Number(process.env.OLLAMA_NUM_CTX ?? 8192),
+  // Memory profile: "full" keeps every word (fine for Claude's window),
+  // "compact" digests older segments to fit a small local context.
+  memoryProfile: (process.env.THIRDCHAIR_MEMORY ??
+    (brain === "claude" ? "full" : "compact")) as "full" | "compact",
   voiceId: process.env.ELEVENLABS_VOICE_ID ?? "21m00Tcm4TlvDq8ikWAM",
   wakePhrase: process.env.WAKE_PHRASE ?? "hey copilot",
   port: Number(process.env.PORT ?? 8787),

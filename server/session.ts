@@ -1,7 +1,7 @@
 import type WebSocket from "ws";
 import { SttStream } from "./stt.ts";
 import { LocalSttStream } from "./stt-local.ts";
-import { TranscriptStore } from "./transcript.ts";
+import { MeetingMemory } from "./memory/index.ts";
 import { Trigger } from "./trigger.ts";
 import { answer, type AnswerHandle } from "./brain.ts";
 import { TtsSpeaker, SentenceChunker } from "./tts.ts";
@@ -47,7 +47,9 @@ function createTts(): AnyTts {
  */
 export class Session {
   private stt = new Map<AudioChannel, AnyStt>();
-  private transcript = new TranscriptStore();
+  private transcript = new MeetingMemory(config.memoryProfile);
+  /** Sentences handed to TTS that we believe actually played, in order. */
+  private spoken: string[] = [];
   private trigger = new Trigger(config.wakePhrase);
   private state: SessionState = "idle";
   private active = false;
@@ -199,9 +201,16 @@ export class Session {
       });
     }
 
-    const chunker = new SentenceChunker((sentence) => void tts?.speak(sentence));
+    this.spoken = [];
+    const chunker = new SentenceChunker((sentence) => {
+      // Record the sentence as it is handed to TTS. On barge-in only the
+      // sentences up to this point are treated as spoken, so history reflects
+      // what the room heard rather than what the model generated.
+      this.spoken.push(sentence);
+      void tts?.speak(sentence);
+    });
 
-    const handle = answer(question, this.transcript.render(), (delta) => {
+    const handle = answer(question, this.transcript.build(question), (delta) => {
       chunker.push(delta);
       this.send({ type: "answer_delta", text: delta });
     });
@@ -210,6 +219,7 @@ export class Session {
     handle.done
       .then((text) => {
         chunker.flush();
+        this.recordSpoken();
         this.send({ type: "answer_done", text });
         if (tts) {
           void tts.end();
@@ -229,6 +239,18 @@ export class Session {
       });
   }
 
+  /**
+   * Record what the copilot actually said into the transcript. An answer cut
+   * off after two of five sentences is recorded as those two sentences — the
+   * unspoken remainder never happened as far as the room is concerned, and
+   * storing it would be hallucination fuel on later questions.
+   */
+  private recordSpoken(): void {
+    const said = this.spoken.join(" ").trim();
+    this.spoken = [];
+    if (said) this.transcript.add("you", said, true);
+  }
+
   /** Stop any in-flight answer and audio (barge-in or new question). */
   private interrupt(): void {
     this.currentAnswer?.abort();
@@ -236,6 +258,7 @@ export class Session {
     if (this.currentSpeaker) {
       this.currentSpeaker.abort();
       this.currentSpeaker = null;
+      this.recordSpoken();
       this.send({ type: "speaking_cancel" });
     }
     if (this.state === "thinking" || this.state === "speaking") this.settle();

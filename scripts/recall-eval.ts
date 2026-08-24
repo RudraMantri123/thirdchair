@@ -8,7 +8,7 @@
  *
  * Run: npx tsx scripts/recall-eval.ts
  */
-import { TranscriptStore } from "../server/transcript.ts";
+import { MeetingMemory, type MemoryProfile } from "../server/memory/index.ts";
 import type { Speaker } from "../shared/protocol.ts";
 
 const UTTERANCES_PER_MIN = 15;
@@ -33,8 +33,8 @@ const FILLER = [
   "mhm right exactly",
 ];
 
-function buildMeeting(minutes: number): TranscriptStore {
-  const store = new TranscriptStore();
+function buildMeeting(minutes: number, profile: MemoryProfile): MeetingMemory {
+  const mem = new MeetingMemory(profile);
   const total = minutes * UTTERANCES_PER_MIN;
   for (let i = 0; i < total; i++) {
     const min = Math.floor(i / UTTERANCES_PER_MIN);
@@ -42,34 +42,43 @@ function buildMeeting(minutes: number): TranscriptStore {
       (p) => p.atMin === min && i % UTTERANCES_PER_MIN === 0,
     );
     const speaker: Speaker = i % 3 === 0 ? "you" : "room";
-    store.add(speaker, planted ? planted.line : FILLER[i % FILLER.length], false);
+    mem.add(speaker, planted ? planted.line : FILLER[i % FILLER.length], false);
   }
-  return store;
+  return mem;
 }
 
 const MEETING_MINUTES = 60;
-const store = buildMeeting(MEETING_MINUTES);
-const prompt = store.render();
 
-console.log(`\nRecall eval — ${MEETING_MINUTES}-minute meeting, prompt is ${prompt.length} chars\n`);
-console.log("  planted at | fact                          | in prompt? | question");
-console.log("  -----------+-------------------------------+------------+---------");
-
-let recalled = 0;
-for (const p of PLANTED) {
-  const present = prompt.includes(p.probe);
-  if (present) recalled++;
+for (const profile of ["full", "compact"] as MemoryProfile[]) {
+  const mem = buildMeeting(MEETING_MINUTES, profile);
   console.log(
-    `  ${String(p.atMin).padStart(7)}min | ${p.probe.padEnd(29)} | ${(present ? "YES" : "LOST").padEnd(10)} | ${p.asks}`,
+    `\n=== profile "${profile}" — ${MEETING_MINUTES}-minute meeting ===\n`,
   );
-}
+  console.log("  planted at | fact                          | in prompt? | question");
+  console.log("  -----------+-------------------------------+------------+---------");
 
-const pct = ((recalled / PLANTED.length) * 100).toFixed(0);
-console.log(`\n  recall: ${recalled}/${PLANTED.length} (${pct}%)`);
-if (recalled < PLANTED.length) {
-  console.log(
-    `  ${PLANTED.length - recalled} question(s) above are UNANSWERABLE — the fact is not in the prompt at all.\n`,
-  );
-} else {
-  console.log("  every planted fact survived into the prompt.\n");
+  let recalled = 0;
+  let maxTokens = 0;
+  for (const p of PLANTED) {
+    // Build the prompt for the question that actually needs this fact.
+    const s = mem.build(p.asks);
+    const prompt = [s.stable, s.recent, s.retrieved].join("\n");
+    maxTokens = Math.max(maxTokens, s.tokens.total);
+    const present = prompt.includes(p.probe);
+    if (present) recalled++;
+    console.log(
+      `  ${String(p.atMin).padStart(7)}min | ${p.probe.padEnd(29)} | ${(present ? "YES" : "LOST").padEnd(10)} | ${p.asks}`,
+    );
+  }
+
+  const pct = ((recalled / PLANTED.length) * 100).toFixed(0);
+  console.log(`\n  recall: ${recalled}/${PLANTED.length} (${pct}%)   peak prompt: ~${maxTokens} tokens`);
+  if (recalled < PLANTED.length) {
+    console.log(
+      `  ${PLANTED.length - recalled} question(s) unanswerable — the fact is not in the prompt.`,
+    );
+  } else {
+    console.log("  every planted fact survived into the prompt.");
+  }
 }
+console.log("");

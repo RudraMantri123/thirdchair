@@ -1,18 +1,15 @@
 /**
- * Memory audit for the transcript store.
- *
- * Simulates a 60-minute meeting and reports the three things that actually
- * cost money and latency: heap growth, prompt size per question, and how
- * much of the rendered prompt prefix is STABLE between consecutive
- * questions (the ceiling on prompt-cache / KV-cache reuse).
+ * Memory audit: heap growth, prompt size, and — the metric that decides
+ * latency — how much of the prompt prefix is BYTE-STABLE between consecutive
+ * questions. That number is the ceiling on prompt-cache and KV-cache reuse.
  *
  * Run: npx tsx scripts/memory-audit.ts
  */
-import { TranscriptStore } from "../server/transcript.ts";
+import { MeetingMemory, type MemoryProfile } from "../server/memory/index.ts";
 import type { Speaker } from "../shared/protocol.ts";
 
 const MINUTES = 60;
-const UTTERANCES_PER_MIN = 15; // one every 4s — a normal conversation
+const UTTERANCES_PER_MIN = 15;
 const SAMPLE = [
   "I think we should push the pricing decision to next week",
   "the enterprise tier at forty nine a seat is where we landed",
@@ -20,6 +17,12 @@ const SAMPLE = [
   "our churn last quarter was about three percent monthly",
   "let's timebox this to ten minutes and move on",
   "the migration is blocked on the vendor contract review",
+];
+const QUESTIONS = [
+  "what did we decide about pricing?",
+  "who owns the follow up?",
+  "what is blocking the migration?",
+  "summarize the last ten minutes",
 ];
 
 function commonPrefixLength(a: string, b: string): number {
@@ -29,76 +32,59 @@ function commonPrefixLength(a: string, b: string): number {
   return i;
 }
 
-const store = new TranscriptStore();
-const total = MINUTES * UTTERANCES_PER_MIN;
+for (const profile of ["full", "compact"] as MemoryProfile[]) {
+  const mem = new MeetingMemory(profile);
+  const total = MINUTES * UTTERANCES_PER_MIN;
+  const askEvery = 5 * UTTERANCES_PER_MIN;
 
-// Ask a question every 5 minutes and compare consecutive renders.
-const askEvery = 5 * UTTERANCES_PER_MIN;
-let prevRender = "";
-const rows: {
-  min: number;
-  entries: number;
-  chars: number;
-  tokens: number;
-  reusePct: number;
-}[] = [];
+  let prevStable = "";
+  const rows: { min: number; tokens: number; reuse: number }[] = [];
+  const heapBefore = process.memoryUsage().heapUsed;
 
-const heapBefore = process.memoryUsage().heapUsed;
+  for (let i = 0; i < total; i++) {
+    const speaker: Speaker = i % 3 === 0 ? "you" : "room";
+    mem.add(speaker, SAMPLE[i % SAMPLE.length], false);
 
-for (let i = 0; i < total; i++) {
-  const speaker: Speaker = i % 3 === 0 ? "you" : "room";
-  store.add(speaker, SAMPLE[i % SAMPLE.length], false);
-
-  if (i > 0 && i % askEvery === 0) {
-    const rendered = store.render();
-    const reuse = prevRender
-      ? (commonPrefixLength(prevRender, rendered) / rendered.length) * 100
-      : 0;
-    rows.push({
-      min: Math.round(i / UTTERANCES_PER_MIN),
-      entries: i + 1,
-      chars: rendered.length,
-      tokens: Math.round(rendered.length / 4),
-      reusePct: reuse,
-    });
-    prevRender = rendered;
+    if (i > 0 && i % askEvery === 0) {
+      const s = mem.build(QUESTIONS[(i / askEvery) % QUESTIONS.length]);
+      // The cacheable prefix is the stable section; the question deliberately
+      // sits after it, so a per-question rewrite costs only its own tokens.
+      const reuse = prevStable
+        ? (commonPrefixLength(prevStable, s.stable) /
+            Math.max(1, s.stable.length)) *
+          100
+        : 0;
+      rows.push({
+        min: Math.round(i / UTTERANCES_PER_MIN),
+        tokens: s.tokens.total,
+        reuse,
+      });
+      prevStable = s.stable;
+    }
   }
-}
 
-const heapAfter = process.memoryUsage().heapUsed;
-
-console.log(`\nSimulated ${MINUTES}-minute meeting: ${total} utterances\n`);
-console.log("  min | entries | prompt chars | ~tokens | prefix reuse");
-console.log("  ----+---------+--------------+---------+-------------");
-for (const r of rows) {
+  const heapAfter = process.memoryUsage().heapUsed;
+  console.log(`\n=== profile "${profile}" — ${MINUTES}-min meeting, ${total} utterances ===\n`);
+  console.log("  min | prompt tokens | stable-prefix reuse");
+  console.log("  ----+---------------+--------------------");
+  for (const r of rows) {
+    console.log(
+      `  ${String(r.min).padStart(3)} | ${String(r.tokens).padStart(13)} | ${r.reuse
+        .toFixed(1)
+        .padStart(17)}%`,
+    );
+  }
+  const avgReuse =
+    rows.slice(1).reduce((n, r) => n + r.reuse, 0) / Math.max(1, rows.length - 1);
   console.log(
-    `  ${String(r.min).padStart(3)} | ${String(r.entries).padStart(7)} | ${String(
-      r.chars,
-    ).padStart(12)} | ${String(r.tokens).padStart(7)} | ${r.reusePct
-      .toFixed(1)
-      .padStart(10)}%`,
+    `\n  mean prefix reuse after warmup: ${avgReuse.toFixed(1)}%   heap: ${(
+      (heapAfter - heapBefore) /
+      1024 /
+      1024
+    ).toFixed(2)} MB`,
+  );
+  console.log(
+    `  claims extracted into the decision journal: ${mem.claims().length}`,
   );
 }
-
-const full = store.render(Number.MAX_SAFE_INTEGER);
-console.log(
-  `\n  transcript held in memory : ${store.export().length} entries, ${full.length} chars`,
-);
-console.log(
-  `  heap growth               : ${((heapAfter - heapBefore) / 1024 / 1024).toFixed(2)} MB`,
-);
-console.log(
-  `  dropped from prompt       : ${full.length - rows.at(-1)!.chars} chars (${(
-    ((full.length - rows.at(-1)!.chars) / full.length) *
-    100
-  ).toFixed(0)}% of the meeting is invisible to the model)`,
-);
-
-// Cost of the naive approach across the meeting, assuming one question
-// every 5 minutes and no cache reuse at all.
-const totalTokens = rows.reduce((n, r) => n + r.tokens, 0);
-console.log(
-  `  input tokens for ${rows.length} questions: ${totalTokens} (no reuse) vs ~${Math.round(
-    totalTokens * 0.1,
-  )} if the prefix were cacheable\n`,
-);
+console.log("");
