@@ -98,7 +98,7 @@ async function main() {
         has("whisper-server") || has("whisper.cpp-server") || has("whisper-cpp-server");
       const model =
         process.env.WHISPER_MODEL ??
-        join(homedir(), ".cache", "whisper", "ggml-base.en.bin");
+        join(homedir(), ".cache", "whisper", "ggml-small.en.bin");
       line(
         FAIL,
         "voice in: whisper-server",

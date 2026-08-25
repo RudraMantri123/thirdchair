@@ -76,12 +76,24 @@ On **Windows**, download a release build from
 [whisper.cpp/releases](https://github.com/ggerganov/whisper.cpp/releases) and set
 `WHISPER_SERVER_BIN` to the extracted server executable.
 
-**2. Get the model** (~150 MB, same on every OS)
+**2. Get the model** (same on every OS)
 
 ```bash
-curl -L --create-dirs -o ~/.cache/whisper/ggml-base.en.bin \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+curl -L --create-dirs -o ~/.cache/whisper/ggml-small.en.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
 ```
+
+`small.en` is the default because it is much more robust in the conditions a
+real room produces, and the latency cost is negligible — both measured on an
+M-series Mac (`scripts/ingest-eval.ts`, `scripts/stt-latency-eval.ts`):
+
+| | clean | office noise | quiet speaker | latency / utterance |
+|---|---|---|---|---|
+| `base.en` (~150 MB) | 15.2% | 21.7% | 26.1% | 78 ms |
+| `small.en` (~490 MB) | **17.4%** | **15.2%** | **17.4%** | 130 ms |
+
+base.en edges it on pristine audio, but meetings are not pristine. Set
+`WHISPER_MODEL` to `ggml-base.en.bin` on a slow machine.
 
 **3. Check and run**
 
@@ -113,8 +125,6 @@ untrusted input and must never be parsed as code.
 > Corporate network blocking Hugging Face? Fetch OpenAI's original weights from
 > their own CDN and convert them with whisper.cpp's
 > `models/convert-pt-to-ggml.py`.
-
-> Corporate network blocking Hugging Face? Download OpenAI's original weights from their own CDN and convert: `curl -O https://openaipublic.azureedge.net/main/whisper/models/25a8566e1d0c1e2231d1c762132cd20e0f96a85d16145c3a00adf5d1ac670ead/base.en.pt`, then run whisper.cpp's `models/convert-pt-to-ggml.py`.
 
 Verify the whole loop without a microphone: `npx tsx scripts/e2e-voice-test.ts` synthesizes a spoken question, streams it in as fake mic audio, and prints every event through to the spoken answer.
 

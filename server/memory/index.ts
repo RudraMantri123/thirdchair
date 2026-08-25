@@ -281,13 +281,25 @@ export class MeetingMemory {
    * Ordered by frequency, capped, and rebuilt only when the vocabulary
    * actually changes — the string is sent with every utterance.
    */
-  vocabularyPrompt(max = 24): string {
+  vocabularyPrompt(max = 16): string {
     if (this.vocab.size === 0) return "";
     if (this.vocabCacheSize === this.vocab.size && this.vocabCache !== null) {
       return this.vocabCache;
     }
     const terms = [...this.vocab.entries()]
-      .filter(([term, n]) => n >= 2 || /[A-Z]/.test(term))
+      // Require REPEATED evidence. This is the important rule: the vocabulary
+      // is derived from the transcript, so a mis-heard token promoted to the
+      // bias prompt would be reinforced into every later utterance — the
+      // recognizer teaching itself its own mistake. Requiring two independent
+      // hearings makes that loop far harder to start.
+      //
+      // The cost is that a name only starts helping the second time it is
+      // said. That is the right trade: over a real meeting recurring names
+      // repeat constantly, and biasing on a single hearing is exactly how a
+      // primed term starts overwriting correct words (measured: with a name
+      // in the prompt, "our churn last quarter" was transcribed as "Arjun
+      // last quarter" in every condition).
+      .filter(([term, n]) => n >= 2 && term.length >= 4)
       .sort((a, b) => b[1] - a[1])
       .slice(0, max)
       .map(([term]) => term);

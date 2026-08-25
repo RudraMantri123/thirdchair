@@ -14,9 +14,13 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+// small.en by default: measured markedly more robust than base.en on the
+// conditions a real room produces (office noise 21.7% -> 15.2% WER, quiet
+// speaker 26.1% -> 17.4%) for only +52 ms per utterance. base.en remains a
+// fine choice on a slow machine — set WHISPER_MODEL to it.
 const MODEL =
   process.env.WHISPER_MODEL ??
-  join(homedir(), ".cache", "whisper", "ggml-base.en.bin");
+  join(homedir(), ".cache", "whisper", "ggml-small.en.bin");
 const PORT = process.env.WHISPER_PORT ?? "8788";
 
 // Homebrew ships `whisper-server`; a source build produces `whisper-server`
@@ -39,7 +43,7 @@ function resolveBinary(): string | null {
 }
 
 const MODEL_URL =
-  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin";
 
 function installHint(): string {
   switch (process.platform) {
@@ -63,9 +67,11 @@ if (!bin) {
 
 if (!existsSync(MODEL)) {
   console.error(`Whisper model not found at ${MODEL}`);
-  console.error(`  Download it (~150 MB):`);
+  console.error(`  Download it (~490 MB for small.en):`);
   console.error(`    curl -L --create-dirs -o "${MODEL}" ${MODEL_URL}`);
-  console.error(`  Or set WHISPER_MODEL to a model you already have.`);
+  console.error(`  Or set WHISPER_MODEL to a model you already have —`);
+  console.error(`  ggml-base.en.bin (~150 MB) is faster but noticeably less`);
+  console.error(`  accurate in a noisy room.`);
   console.error(
     `  If your network blocks Hugging Face, fetch OpenAI's original weights and\n  convert them with whisper.cpp's models/convert-pt-to-ggml.py instead.`,
   );
