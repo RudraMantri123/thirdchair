@@ -127,11 +127,11 @@ export class Session {
     if (!stt) {
       stt = createStt();
       const speaker = SPEAKER_BY_CHANNEL[channel];
-      // Feed the recognizer the meeting's own vocabulary. Names and product
-      // terms already heard bias decoding, which is where a general-purpose
-      // model is weakest — measured 21.1% -> 15.8% WER on proper nouns.
+      // Give the recognizer the meeting's own vocabulary for POST-HOC
+      // correction. Deliberately not used to prime the decoder — that was
+      // measured to corrupt correct words.
       if (stt instanceof LocalSttStream) {
-        stt.promptProvider = () => this.transcript.vocabularyPrompt();
+        stt.vocabularyProvider = () => this.transcript.vocabularyTerms();
       }
       stt.on("partial", (text) => this.send({ type: "partial", speaker, text }));
       stt.on("committed", (text) => this.onCommitted(speaker, text));

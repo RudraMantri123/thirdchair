@@ -69,7 +69,7 @@ export class MeetingMemory {
   private claimWatermark = 0;
   /** Entity -> times heard. Feeds the recognizer its own vocabulary. */
   private vocab = new Map<string, number>();
-  private vocabCache: string | null = null;
+  private vocabCache: string[] | null = null;
   private vocabCacheSize = -1;
 
   constructor(
@@ -272,17 +272,18 @@ export class MeetingMemory {
   }
 
   /**
-   * The meeting's own vocabulary, formatted as a decoding bias prompt for the
-   * recognizer. This closes a useful loop: a name or product term heard once
-   * makes the recognizer far more likely to get it right the next time, which
-   * is exactly where a general-purpose model is weakest. Measured 21.1% ->
-   * 15.8% WER on a sentence full of proper nouns (scripts/asr-eval.ts).
+   * The meeting's own recurring vocabulary, for POST-HOC correction of
+   * misheard terms (see memory/correct.ts).
    *
-   * Ordered by frequency, capped, and rebuilt only when the vocabulary
-   * actually changes — the string is sent with every utterance.
+   * These terms are deliberately NOT sent to the recognizer as a decoding
+   * prompt. That was tried and measured harmful: priming whisper with a word
+   * list reproducibly corrupted correct words ("our churn last quarter" ->
+   * "Arjun last quarter"), because the prompt slot is where whisper expects
+   * the previous transcript, so a list acts as a generative prior. Correcting
+   * after the fact cannot invent a term that was not already heard.
    */
-  vocabularyPrompt(max = 16): string {
-    if (this.vocab.size === 0) return "";
+  vocabularyTerms(max = 24): string[] {
+    if (this.vocab.size === 0) return [];
     if (this.vocabCacheSize === this.vocab.size && this.vocabCache !== null) {
       return this.vocabCache;
     }
@@ -303,9 +304,7 @@ export class MeetingMemory {
       .sort((a, b) => b[1] - a[1])
       .slice(0, max)
       .map(([term]) => term);
-    this.vocabCache = terms.length
-      ? `Meeting transcript. Recurring names and terms: ${terms.join(", ")}.`
-      : "";
+    this.vocabCache = terms;
     this.vocabCacheSize = this.vocab.size;
     return this.vocabCache;
   }

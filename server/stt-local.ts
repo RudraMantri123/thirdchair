@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { gzipSync } from "node:zlib";
 import { config } from "./config.ts";
 import type { SttEvents } from "./stt.ts";
 import { AdaptiveVad } from "./audio/vad.ts";
@@ -10,6 +11,7 @@ import {
   normalizeGainInPlace,
   padToMinimum,
 } from "./audio/preprocess.ts";
+import { VocabularyCorrector } from "./memory/correct.ts";
 import { MIC_SAMPLE_RATE } from "../shared/protocol.ts";
 
 const SILENCE_END_MS = 700;
@@ -30,11 +32,34 @@ const PRE_ROLL_MS = 1024;
  * they get filtered here rather than reaching the transcript, where they would
  * become fabricated meeting content.
  */
-const HALLUCINATIONS = [
+const HALLUCINATIONS = new Set([
   "thank you", "thanks for watching", "thank you for watching",
-  "please subscribe", "subscribe to my channel", "bye", "okay",
-  "you", "thanks", "the end", "music", "silence",
-];
+  "thanks for listening", "thank you for listening", "thank you very much",
+  "please subscribe", "subscribe to my channel", "like and subscribe",
+  "dont forget to subscribe", "see you next time", "see you in the next video",
+  "bye", "bye bye", "goodbye", "okay", "ok", "you", "yeah", "thanks",
+  "the end", "music", "silence", "applause", "laughter", "outro music",
+  "subtitles by the amaraorg community", "transcription by castingwordscom",
+  "www mooji org", "sous titrage societe radio canada", "amaraorg",
+]);
+
+/**
+ * Whisper's repetition guard is not doing its job for us, for two reasons:
+ * whisper.cpp does not implement openai's gzip compression-ratio check at all,
+ * and its own entropy check is gated on `result_len > 32` tokens — longer than
+ * most single utterances. So the guard effectively never fires here, and we
+ * have to run openai's version ourselves.
+ *
+ * A looping transcript compresses far better than natural speech; openai
+ * rejects above 2.4.
+ */
+const COMPRESSION_RATIO_LIMIT = 2.4;
+
+function compressionRatio(text: string): number {
+  const raw = Buffer.from(text, "utf8");
+  if (raw.length === 0) return 0;
+  return raw.length / gzipSync(raw).length;
+}
 
 /**
  * Fully local transcription: adaptive voice activity detection over the
@@ -65,8 +90,12 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
   private warnedClipping = false;
   private warnedQuiet = false;
 
-  /** Vocabulary bias for the recognizer, supplied by the session. */
-  promptProvider: (() => string) | null = null;
+  /**
+   * The meeting's recurring vocabulary, used to CORRECT output — never to
+   * prime the decoder. See memory/correct.ts for why.
+   */
+  vocabularyProvider: (() => string[]) | null = null;
+  private corrector = new VocabularyCorrector();
 
   start(): void {
     this.closed = false;
@@ -189,11 +218,31 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
         "utterance.wav",
       );
       form.append("response_format", "json");
-      // Bias decoding with the meeting's own vocabulary. A name heard once is
-      // then far more likely to be transcribed correctly the next time, which
-      // is exactly where a general model is weakest.
-      const bias = this.promptProvider?.();
-      if (bias) form.append("prompt", bias);
+
+      // Decode parameters worth setting explicitly, all of them cases where
+      // whisper.cpp's default differs from openai's reference behaviour:
+      //
+      //  suppress_non_speech - ON in openai, OFF in whisper.cpp. Blocks the
+      //    "[BRACKETED]" / music-note annotation family at the logit level.
+      //  logprob_thold       - no_speech_thold is INERT without it: both
+      //    implementations only classify silence when the average logprob is
+      //    ALSO below this bar. Passing one without the other does nothing.
+      //  max_context = 0     - each utterance is POSTed independently, so
+      //    carrying decoder text context across them would only invite the
+      //    runaway-repetition feedback loop for no benefit.
+      //
+      // Beam size is deliberately NOT set: on meeting speech, beam search
+      // with temperature fallback measurably HURTS (Whisper paper, AMI-IHM:
+      // small.en 17.5% greedy vs 17.9% beam), while helping only on read
+      // speech. Greedy is both faster and better for this domain.
+      form.append("suppress_non_speech", "true");
+      form.append("no_speech_thold", "0.6");
+      form.append("logprob_thold", "-1.0");
+      form.append("max_context", "0");
+
+      // No `prompt` is sent. Biasing the decoder with the meeting's
+      // vocabulary was measured to corrupt correct words; correction happens
+      // after decoding instead.
       const res = await fetch(`${config.whisperUrl}/inference`, {
         method: "POST",
         body: form,
@@ -205,9 +254,15 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
       const clean = (text ?? "")
         .replace(/\[[^\]]*\]|\([^)]*\)/g, "") // [BLANK_AUDIO], (door closes)…
         .trim();
-      if (clean && !this.closed && !isHallucination(clean)) {
-        this.emit("committed", clean);
-      }
+      if (!clean || this.closed || isHallucination(clean)) return;
+
+      // Repair misheard vocabulary terms deterministically. This can only
+      // rewrite a token already phonetically close to a known term, and it
+      // refuses to touch ordinary English words.
+      const terms = this.vocabularyProvider?.() ?? [];
+      this.corrector.setTerms(terms);
+      const { text: fixed } = this.corrector.correct(clean);
+      this.emit("committed", fixed);
     } catch (err) {
       const message = `Local STT: ${
         err instanceof Error ? err.message : String(err)
@@ -237,6 +292,14 @@ function rms(samples: Int16Array): number {
  * let's ship it" is real speech, so length is the discriminator.
  */
 function isHallucination(text: string): boolean {
-  const bare = text.toLowerCase().replace(/[^a-z ]/g, "").trim();
-  return HALLUCINATIONS.includes(bare);
+  const bare = text.toLowerCase().replace(/[^a-z ]/g, " ").replace(/\s+/g, " ").trim();
+  if (HALLUCINATIONS.has(bare)) return true;
+
+  // A short utterance that is one phrase repeated is a loop, not speech.
+  const words = bare.split(" ").filter(Boolean);
+  if (words.length >= 6) {
+    const unique = new Set(words).size;
+    if (unique / words.length < 0.35) return true;
+  }
+  return compressionRatio(text) > COMPRESSION_RATIO_LIMIT;
 }

@@ -57,6 +57,8 @@ export function normalizeGainInPlace(
   pcm: Int16Array,
   targetRms = 2600,
   maxGain = 8,
+  /** Fraction of full scale the loudest sample may reach. */
+  peakCeiling = 0.89,
 ): LevelStats {
   if (pcm.length === 0) return { rms: 0, peak: 0, appliedGain: 1 };
 
@@ -71,7 +73,13 @@ export function normalizeGainInPlace(
   const rms = Math.sqrt(sumSquares / pcm.length);
   if (rms < 1 || peak === 0) return { rms, peak, appliedGain: 1 };
 
-  const headroom = 32000 / peak;
+  // Whisper's log-mel front-end is NOT gain-invariant: the
+  // `max(log_spec, log_spec.max() - 8)` step is a FLOOR, not a
+  // max-subtraction, so absolute level survives as a uniform offset of
+  // 0.5*log10(gain) on the encoder input. What the front-end effectively pins
+  // is PEAK mel power, so a peak ceiling is better aligned with it than RMS
+  // alone — we target RMS but never let the peak exceed the ceiling.
+  const headroom = (32767 * peakCeiling) / peak;
   const gain = Math.min(targetRms / rms, headroom, maxGain);
   if (gain > 0.99 && gain < 1.01) return { rms, peak, appliedGain: 1 };
 

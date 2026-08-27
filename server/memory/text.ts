@@ -281,3 +281,49 @@ export function salience(text: string): number {
   if (words < 5) score -= 0.2;
   return Math.max(0, Math.min(1, score));
 }
+
+/**
+ * American Soundex: words with the same code sound alike. Used both for
+ * wake-phrase matching and for correcting misheard vocabulary terms.
+ */
+export function soundex(word: string): string {
+  const codes: Record<string, string> = {
+    b: "1", f: "1", p: "1", v: "1",
+    c: "2", g: "2", j: "2", k: "2", q: "2", s: "2", x: "2", z: "2",
+    d: "3", t: "3",
+    l: "4",
+    m: "5", n: "5",
+    r: "6",
+  };
+  const t = word.toLowerCase().replace(/[^a-z]/g, "");
+  if (!t) return "";
+  let out = t[0].toUpperCase();
+  let prev = codes[t[0]] ?? "";
+  for (let i = 1; i < t.length && out.length < 4; i++) {
+    const code = codes[t[i]] ?? "";
+    if (code && code !== prev) out += code;
+    if (t[i] !== "h" && t[i] !== "w") prev = code;
+  }
+  return out.padEnd(4, "0");
+}
+
+/** Levenshtein distance. Small strings only. */
+export function editDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  const m = a.length;
+  const n = b.length;
+  if (m === 0 || n === 0) return m + n;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const curr = [i];
+    for (let j = 1; j <= n; j++) {
+      curr[j] = Math.min(
+        prev[j] + 1,
+        curr[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    prev = curr;
+  }
+  return prev[n];
+}

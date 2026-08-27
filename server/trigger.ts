@@ -5,6 +5,8 @@
  * "hey co-pilot", "hey, copilot", "a copilot"...), so each word is matched
  * loosely and separators are tolerated.
  */
+import { soundex, editDistance } from "./memory/text.ts";
+
 export class Trigger {
   private regex: RegExp;
   private words: string[] = [];
@@ -79,7 +81,7 @@ export class Trigger {
         // extra slack; phonetic equality catches the rest ("coppolait").
         const tolerance = want.length >= 5 ? 2 : j === 0 ? 2 : 1;
         if (
-          levenshtein(heard, want) > tolerance &&
+          editDistance(heard, want) > tolerance &&
           soundex(heard) !== soundex(want)
         ) {
           ok = false;
@@ -106,45 +108,4 @@ export class Trigger {
   }
 }
 
-/** American Soundex: same code = words sound alike ("copilot"/"coppolait"). */
-function soundex(word: string): string {
-  const codes: Record<string, string> = {
-    b: "1", f: "1", p: "1", v: "1",
-    c: "2", g: "2", j: "2", k: "2", q: "2", s: "2", x: "2", z: "2",
-    d: "3", t: "3",
-    l: "4",
-    m: "5", n: "5",
-    r: "6",
-  };
-  const s = word.toLowerCase().replace(/[^a-z]/g, "");
-  if (!s) return "";
-  let out = s[0].toUpperCase();
-  let prev = codes[s[0]] ?? "";
-  for (let i = 1; i < s.length && out.length < 4; i++) {
-    const code = codes[s[i]] ?? "";
-    if (code && code !== prev) out += code;
-    if (s[i] !== "h" && s[i] !== "w") prev = code;
-  }
-  return out.padEnd(4, "0");
-}
 
-/** Classic dynamic-programming edit distance (small strings only). */
-function levenshtein(a: string, b: string): number {
-  if (a === b) return 0;
-  const m = a.length;
-  const n = b.length;
-  if (m === 0 || n === 0) return m + n;
-  let prev = Array.from({ length: n + 1 }, (_, j) => j);
-  for (let i = 1; i <= m; i++) {
-    const curr = [i];
-    for (let j = 1; j <= n; j++) {
-      curr[j] = Math.min(
-        prev[j] + 1,
-        curr[j - 1] + 1,
-        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
-      );
-    }
-    prev = curr;
-  }
-  return prev[n];
-}
