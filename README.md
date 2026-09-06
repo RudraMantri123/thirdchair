@@ -34,7 +34,7 @@ Every hop is a websocket and the audio stays raw PCM on both sides — no file e
 You need an [ElevenLabs API key](https://elevenlabs.io/) (free tier works) and a brain — [Anthropic](https://console.anthropic.com/) by default, or a **free** one (see below).
 
 ```bash
-git clone https://github.com/YOURNAME/thirdchair
+git clone https://github.com/RudraMantri123/thirdchair
 cd thirdchair
 npm install
 cp .env.example .env   # put your two keys in
