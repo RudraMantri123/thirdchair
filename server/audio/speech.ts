@@ -59,21 +59,50 @@ async function which(cmd: string): Promise<boolean> {
 
 // ---- macOS ------------------------------------------------------------------
 
+/**
+ * `say` with the system default voice fails SILENTLY when that voice is one
+ * that has not been downloaded (common after picking a premium/Siri voice in
+ * Settings): it exits 0 and writes a few milliseconds of nothing. Output far
+ * shorter than the text could possibly take is treated as that failure, and
+ * the engine switches once, for the life of the process, to a voice that
+ * ships with every macOS install. THIRDCHAIR_SAY_VOICE pins a voice outright.
+ */
+const MAC_FALLBACK_VOICE = "Samantha";
+let macVoice: string | undefined = process.env.THIRDCHAIR_SAY_VOICE || undefined;
+
+async function sayOnce(
+  text: string,
+  targetRate: number,
+  voice: string | undefined,
+): Promise<Int16Array> {
+  return withTempDir(async (dir) => {
+    const wav = join(dir, "out.wav");
+    const txt = join(dir, "in.txt");
+    await writeFile(txt, text, "utf8");
+    // `say` can emit our target rate directly, so no resampling is needed.
+    await run("say", [
+      ...(voice ? ["-v", voice] : []),
+      "-o", wav,
+      `--data-format=LEI16@${targetRate}`,
+      "-f", txt,
+    ]);
+    return normalize(wav, targetRate);
+  });
+}
+
 const macSay: SpeechEngine = {
   name: "macOS say",
   async speak(text, targetRate) {
-    return withTempDir(async (dir) => {
-      const wav = join(dir, "out.wav");
-      const txt = join(dir, "in.txt");
-      await writeFile(txt, text, "utf8");
-      // `say` can emit our target rate directly, so no resampling is needed.
-      await run("say", [
-        "-o", wav,
-        `--data-format=LEI16@${targetRate}`,
-        "-f", txt,
-      ]);
-      return normalize(wav, targetRate);
-    });
+    const pcm = await sayOnce(text, targetRate, macVoice);
+    // ~30 ms per character is already very fast speech; 100 ms total is a
+    // floor no real utterance of 3+ characters comes in under.
+    const tooShort = pcm.length < targetRate * 0.1 && text.trim().length >= 3;
+    if (!tooShort || macVoice) return pcm;
+    macVoice = MAC_FALLBACK_VOICE;
+    console.warn(
+      `  say: the default system voice produced no audio; using "${MAC_FALLBACK_VOICE}" (set THIRDCHAIR_SAY_VOICE to choose).`,
+    );
+    return sayOnce(text, targetRate, macVoice);
   },
 };
 

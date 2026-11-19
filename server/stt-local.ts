@@ -89,6 +89,8 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
   private frames = 0;
   private warnedClipping = false;
   private warnedQuiet = false;
+  /** Aborts an in-flight whisper call on stop() so nothing outlives us. */
+  private inflight = new AbortController();
 
   /**
    * The meeting's recurring vocabulary, used to CORRECT output — never to
@@ -103,6 +105,8 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
 
   stop(): void {
     this.closed = true;
+    this.inflight.abort();
+    this.inflight = new AbortController();
     this.utterance.clear();
     this.preRoll.clear();
     this.inSpeech = false;
@@ -153,7 +157,9 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
       this.utterance.clear();
       this.speechMs = 0;
       this.silenceMs = 0;
-      if (pcm16) this.enqueue(pcm16);
+      // The VAD commit instant is the turn's latency origin. It already
+      // trails the last syllable by SILENCE_END_MS of hangover.
+      if (pcm16) this.enqueue(pcm16, performance.now());
     }
   }
 
@@ -195,11 +201,12 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
     }
   }
 
-  private enqueue(pcm: Int16Array): void {
-    this.inference = this.inference.then(() => this.transcribe(pcm));
+  private enqueue(pcm: Int16Array, speechEndAt: number): void {
+    this.inference = this.inference.then(() => this.transcribe(pcm, speechEndAt));
   }
 
-  private async transcribe(pcm: Int16Array): Promise<void> {
+  private async transcribe(pcm: Int16Array, speechEndAt: number): Promise<void> {
+    if (this.closed) return;
     try {
       // Condition the signal the way the model expects: DC/rumble removed,
       // level normalized, and padded if very short. Measured together these
@@ -243,9 +250,15 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
       // No `prompt` is sent. Biasing the decoder with the meeting's
       // vocabulary was measured to corrupt correct words; correction happens
       // after decoding instead.
+      // Bounded: a wedged whisper-server must not stall every later
+      // utterance queued behind this one.
       const res = await fetch(`${config.whisperUrl}/inference`, {
         method: "POST",
         body: form,
+        signal: AbortSignal.any([
+          this.inflight.signal,
+          AbortSignal.timeout(config.timeouts.sttCommitMs),
+        ]),
       });
       if (!res.ok) {
         throw new Error(`whisper-server ${res.status} ${await res.text()}`);
@@ -262,11 +275,15 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
       const terms = this.vocabularyProvider?.() ?? [];
       this.corrector.setTerms(terms);
       const { text: fixed } = this.corrector.correct(clean);
-      this.emit("committed", fixed);
+      this.emit("committed", fixed, speechEndAt);
     } catch (err) {
-      const message = `Local STT: ${
-        err instanceof Error ? err.message : String(err)
-      }. Is whisper-server running? Start it with: npm run voice:local`;
+      if (this.closed) return;
+      const timedOut = err instanceof Error && err.name === "TimeoutError";
+      const message = timedOut
+        ? `Local STT: whisper-server took longer than ${config.timeouts.sttCommitMs} ms; utterance dropped.`
+        : `Local STT: ${
+            err instanceof Error ? err.message : String(err)
+          }. Is whisper-server running? Start it with: npm run voice:local`;
       if (message !== this.lastError) {
         this.lastError = message;
         this.emit("error", message);

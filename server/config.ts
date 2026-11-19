@@ -19,6 +19,12 @@ if (!["claude", "groq", "ollama"].includes(brain)) {
 
 const elevenLabsApiKey = key("ELEVENLABS_API_KEY");
 
+/** A positive integer env var in milliseconds, else the default. */
+function ms(name: string, fallback: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
 export const config = {
   elevenLabsApiKey,
   // Voice defaults to ElevenLabs when a key is present, otherwise the fully
@@ -48,6 +54,32 @@ export const config = {
   voiceId: process.env.ELEVENLABS_VOICE_ID ?? "21m00Tcm4TlvDq8ikWAM",
   wakePhrase: process.env.WAKE_PHRASE ?? "hey copilot",
   port: Number(process.env.PORT ?? 8787),
+  // Base of the ElevenLabs realtime websockets. Overridable so a test can
+  // point it at an unreachable host and exercise the local fallback path.
+  elevenLabsWsBase: process.env.ELEVENLABS_WS_BASE ?? "wss://api.elevenlabs.io",
+  /**
+   * Every network wait on the answer path has a deadline. Nothing may hang a
+   * turn indefinitely; each of these either degrades (fallback / holding
+   * phrase) or ends the turn with a spoken apology.
+   */
+  timeouts: {
+    // Cloud STT socket open + session_started. Missing it falls back to local.
+    sttConnectMs: ms("THIRDCHAIR_STT_CONNECT_TIMEOUT_MS", 5000),
+    // Local: one whisper /inference call. Cloud: last partial -> commit; on a
+    // miss the last partial is promoted to a committed segment.
+    sttCommitMs: ms("THIRDCHAIR_STT_COMMIT_TIMEOUT_MS", 8000),
+    // No token by then: speak a short holding phrase and keep waiting.
+    llmFirstTokenMs: ms("THIRDCHAIR_LLM_FIRST_TOKEN_TIMEOUT_MS", 2500),
+    // Whole answer. On a miss the answer is aborted and an apology spoken.
+    llmTotalMs: ms("THIRDCHAIR_LLM_TOTAL_TIMEOUT_MS", 25000),
+    // First sentence handed to TTS -> first audio byte back.
+    ttsFirstByteMs: ms("THIRDCHAIR_TTS_FIRST_BYTE_TIMEOUT_MS", 4000),
+  },
+  // Per-turn latency records, one JSON object per line. "off" disables.
+  latencyLog: process.env.THIRDCHAIR_LATENCY_LOG ?? "logs/latency.jsonl",
+  // Opt-in: record each session's input audio frames for replay.
+  record: /^(1|true|yes|on)$/i.test(process.env.THIRDCHAIR_RECORD ?? ""),
+  recordDir: process.env.THIRDCHAIR_RECORD_DIR ?? "recordings",
 };
 
 /** Why voice (STT + TTS) can't run, or undefined if it can. */

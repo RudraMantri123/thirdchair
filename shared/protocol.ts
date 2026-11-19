@@ -45,8 +45,78 @@ export interface TranscriptEntry {
   whileSpeaking: boolean;
 }
 
+/**
+ * Per-turn latency budget. Every stage of one assistant turn, stamped on the
+ * server's monotonic clock and expressed in ms from the turn's origin (end of
+ * user speech for a spoken question, receipt for a typed one).
+ */
+export const LATENCY_COMPONENTS = [
+  "stt", // VAD commit -> final transcript
+  "wake", // final transcript -> LLM request sent (wake match, prompt build)
+  "llmTtft", // LLM request -> first token
+  "llmToTts", // first token -> first sentence handed to TTS
+  "ttsTtfb", // TTS request -> first audio byte
+  "playback", // first audio byte -> audible in the client
+] as const;
+export type LatencyComponent = (typeof LATENCY_COMPONENTS)[number];
+
+export type LatencyMark =
+  | "speechEnd"
+  | "transcript"
+  | "wake"
+  | "llmRequest"
+  | "llmFirstToken"
+  | "firstSentence"
+  | "ttsRequest"
+  | "ttsFirstByte"
+  | "playbackStart"
+  | "holdSpoken"
+  | "holdPlaybackStart"
+  | "end";
+
+export type TurnOutcome =
+  | "answered" // spoken (or text-only when voice is off) to completion
+  | "barged_in" // interrupted by the user or a new question
+  | "llm_timeout" // total deadline missed; apology spoken
+  | "error"; // the brain failed; apology spoken
+
+export interface TurnRecord {
+  v: 1;
+  turnId: string;
+  sessionId: string;
+  /** Wall-clock ISO time of the turn origin (for humans; never for deltas). */
+  at: string;
+  /** "live", or whatever a replay/test client tagged the session with. */
+  source: string;
+  trigger: "voice" | "typed";
+  question: string;
+  engines: { stt: string; llm: string; tts: string };
+  /** ms from origin, monotonic; absent when the stage never happened. */
+  marks: Partial<Record<LatencyMark, number>>;
+  /** Stage durations in ms; null when either bounding mark is missing. */
+  components: Record<LatencyComponent, number | null>;
+  /** Origin -> first answer audio audible; null if nothing was played. */
+  e2eMs: number | null;
+  /** Origin -> first sound of any kind (the holding phrase counts). */
+  firstSoundMs: number | null;
+  /** Client-reported scheduling lead before the first chunk sounded. */
+  clientLeadMs: number | null;
+  /** Fallbacks and deadline misses that shaped this turn. Empty = clean. */
+  degraded: string[];
+  outcome: TurnOutcome;
+}
+
+export interface LatencyStat {
+  n: number;
+  p50: number;
+  p95: number;
+}
+export type LatencySummary = Partial<
+  Record<LatencyComponent | "e2e", LatencyStat>
+>;
+
 export type ClientMessage =
-  | { type: "start" }
+  | { type: "start"; source?: string }
   | { type: "stop" }
   // Ask directly from the UI, bypassing the wake phrase.
   | { type: "ask"; text: string }
@@ -54,18 +124,30 @@ export type ClientMessage =
   | { type: "cancel" }
   | { type: "config"; wakePhrase?: string }
   // Request the full transcript (for download / minutes).
-  | { type: "export" };
+  | { type: "export" }
+  // The first chunk following an audio_mark became audible.
+  | {
+      type: "playback_started";
+      turnId: string;
+      kind: "hold" | "answer";
+      leadMs: number;
+    };
 
 export type ServerMessage =
   | { type: "ready"; wakePhrase: string; state: SessionState }
   | { type: "state"; state: SessionState }
   | { type: "partial"; speaker: Speaker; text: string }
   | { type: "committed"; entry: TranscriptEntry }
-  | { type: "triggered"; question: string; speaker: Speaker }
+  | { type: "triggered"; question: string; speaker: Speaker; turnId: string }
   | { type: "answer_delta"; text: string }
   | { type: "answer_done"; text: string }
   // Client should drop any queued playback audio (barge-in).
   | { type: "speaking_cancel" }
+  // The next binary frame is the first of a hold phrase / the answer.
+  | { type: "audio_mark"; turnId: string; kind: "hold" | "answer" }
+  | { type: "turn_latency"; record: TurnRecord; summary: LatencySummary }
+  /** An engine fell back or missed a deadline; `active` is the full set. */
+  | { type: "degraded"; message: string; active: string[] }
   | { type: "transcript_export"; startedAt: number; entries: TranscriptEntry[] }
   /** Actionable advice about input audio quality, not a failure. */
   | { type: "notice"; message: string }

@@ -1,58 +1,30 @@
 // End-to-end voice-loop test: streams a synthesized spoken question into
-// ThirdChair's websocket as if it were mic audio, and reports every event.
-import WebSocket from "ws";
-import { testSpeech } from "./lib/test-speech.ts";
+// ThirdChair's websocket as if it were mic audio, reports every event, and
+// prints the turn's latency budget.
+//
+// Needs a running server (npm run dev:server) on the local path.
+import { synthSession, runHeadless, formatRecords } from "./lib/headless-client.ts";
 
-const samples = await testSpeech("hey copilot, what is two plus two?", 16000);
-const pcm = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
+const events = await synthSession(["hey copilot, what is two plus two?"]);
 
-const ws = new WebSocket("ws://localhost:8787/ws");
-ws.binaryType = "nodebuffer";
-let audioBytes = 0;
-
-ws.on("open", () => {
-  ws.send(JSON.stringify({ type: "start" }));
-  const FRAME = 4096; // 2048 samples = 128ms
-  // Real capture always carries a moment of room tone before the first word
-  // (the user clicks Start, then speaks). Send some, so the detector observes
-  // a noise floor instead of being handed speech on frame zero.
-  let lead = 8;
-  let pos = 0;
-  const timer = setInterval(() => {
-    let chunk: Buffer;
-    if (lead > 0) {
-      lead--;
-      chunk = Buffer.alloc(FRAME);
-    } else if (pos < pcm.length) {
-      chunk = pcm.subarray(pos, pos + FRAME);
-      pos += FRAME;
-    } else {
-      chunk = Buffer.alloc(FRAME); // trailing silence to end the utterance
-      pos += FRAME;
-      if (pos > pcm.length + 16 * FRAME) clearInterval(timer);
-    }
-    const frame = Buffer.alloc(1 + chunk.length);
-    frame[0] = 0; // CHANNEL_MIC
-    chunk.copy(frame, 1);
-    ws.send(frame);
-  }, 128);
+const result = await runHeadless(events, {
+  source: "e2e-voice-test",
+  timeoutMs: 60000,
+  onMessage: (msg) => console.log("EVENT:", JSON.stringify(msg).slice(0, 220)),
 });
 
-ws.on("message", (data, isBinary) => {
-  if (isBinary) {
-    audioBytes += (data as Buffer).length;
-    return;
-  }
-  const msg = JSON.parse(data.toString());
-  console.log("EVENT:", JSON.stringify(msg).slice(0, 220));
-  if (msg.type === "state" && msg.state === "listening" && audioBytes > 0) {
-    console.log(`TTS AUDIO RECEIVED: ${audioBytes} bytes (~${(audioBytes / 2 / 24000).toFixed(1)}s)`);
-    ws.close();
-    process.exit(0);
-  }
-});
+console.log(
+  `TTS AUDIO RECEIVED: ${result.audioBytes} bytes (~${(result.audioBytes / 2 / 24000).toFixed(1)}s)`,
+);
+if (result.records.length) {
+  console.log("\nLatency budget (ms):\n" + formatRecords(result.records));
+}
 
-setTimeout(() => {
-  console.log(`TIMEOUT. audio bytes so far: ${audioBytes}`);
+const answered = result.records.some((r) => r.outcome === "answered");
+if (result.timedOut || !answered || result.audioBytes === 0) {
+  console.log(
+    `FAIL: ${result.timedOut ? "timed out" : !answered ? "no answered turn" : "no audio"}`,
+  );
   process.exit(1);
-}, 60000);
+}
+process.exit(0);

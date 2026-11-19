@@ -9,7 +9,8 @@ export class AudioPlayback {
   private playhead = 0;
   private sources = new Set<AudioBufferSourceNode>();
 
-  play(chunk: ArrayBuffer): void {
+  /** Schedules the chunk; returns seconds until it becomes audible. */
+  play(chunk: ArrayBuffer): number {
     void this.ctx.resume();
     const int16 = new Int16Array(chunk);
     const float32 = new Float32Array(int16.length);
@@ -28,7 +29,9 @@ export class AudioPlayback {
     // Small initial lead-in absorbs network jitter on the first chunk.
     if (this.playhead < now) this.playhead = now + 0.05;
     source.start(this.playhead);
+    const lead = Math.max(0, this.playhead - now);
     this.playhead += buffer.duration;
+    return lead;
   }
 
   /** Barge-in: drop everything queued and go silent now. */

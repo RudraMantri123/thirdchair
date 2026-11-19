@@ -203,3 +203,92 @@ button.primary {
 .line.notice {
   color: #fbbf24;
 }
+
+/* ---- latency budget panel ------------------------------------------------ */
+
+.degraded {
+  font-size: 12px;
+  color: #fbbf24;
+  border: 1px solid #78350f;
+  background: #1c1407;
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+
+.latency {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.latency-head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.latency-head strong {
+  color: var(--text);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.latency-tags {
+  color: #fbbf24;
+}
+
+.latency-bar {
+  display: flex;
+  height: 14px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--border);
+  gap: 1px;
+}
+
+.latency-bar span {
+  min-width: 2px;
+}
+
+.latency-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.latency-legend i {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  margin-right: 4px;
+  vertical-align: -1px;
+}
+
+.latency-table {
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.latency-table th,
+.latency-table td {
+  padding: 1px 10px 1px 0;
+  text-align: right;
+  font-weight: normal;
+}
+
+.latency-table th:first-child,
+.latency-table td:first-child {
+  text-align: left;
+}
+
+.latency-table td {
+  color: var(--text);
+}

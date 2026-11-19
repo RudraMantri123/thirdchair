@@ -27,7 +27,19 @@
         </button>
         <button id="btn-stop-speaking" disabled>Stop speaking</button>
         <button id="btn-export" title="Download the transcript so far">Transcript ⤓</button>
+        <span class="degraded" id="degraded" hidden></span>
         <span class="status" id="status">idle</span>
+      </section>
+
+      <section class="latency" id="latency" hidden aria-label="Answer latency">
+        <div class="latency-head">
+          <span>Last answer</span>
+          <strong id="latency-e2e">—</strong>
+          <span class="latency-tags" id="latency-tags"></span>
+        </div>
+        <div class="latency-bar" id="latency-bar"></div>
+        <div class="latency-legend" id="latency-legend"></div>
+        <table class="latency-table" id="latency-table"></table>
       </section>
 
       <section class="feed" id="feed" aria-live="polite"></section>
