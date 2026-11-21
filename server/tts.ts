@@ -30,7 +30,7 @@ export class TtsSpeaker extends EventEmitter<TtsEvents> {
       inactivity_timeout: "60",
     });
     this.ws = new WebSocket(
-      `wss://api.elevenlabs.io/v1/text-to-speech/${config.voiceId}/stream-input?${params}`,
+      `${config.elevenLabsWsBase}/v1/text-to-speech/${config.voiceId}/stream-input?${params}`,
       { headers: { "xi-api-key": config.elevenLabsApiKey } },
     );
 
@@ -50,6 +50,9 @@ export class TtsSpeaker extends EventEmitter<TtsEvents> {
       });
       this.ws.once("error", reject);
     });
+    // Connection failures are reported through the "error" event; this only
+    // keeps a rejection nobody awaited yet from becoming unhandled.
+    this.open.catch(() => {});
 
     this.ws.on("message", (data) => {
       let msg: { audio?: string; isFinal?: boolean; error?: string };
@@ -93,7 +96,7 @@ export class TtsSpeaker extends EventEmitter<TtsEvents> {
   abort(): void {
     this.aborted = true;
     this.removeAllListeners("audio");
-    this.ws.close();
+    this.ws.terminate();
   }
 }
 

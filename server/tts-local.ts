@@ -3,6 +3,22 @@ import type { TtsEvents } from "./tts.ts";
 import { TTS_SAMPLE_RATE } from "../shared/protocol.ts";
 import { detectSpeechEngine, speechInstallHint } from "./audio/speech.ts";
 
+let warm: Promise<void> | null = null;
+
+/**
+ * Render one throwaway word so the first real sentence does not pay the
+ * engine's cold start (process spawn, voice load, and on macOS the dead
+ * default-voice probe in speech.ts) inside a turn's TTS deadline. Once per
+ * process; failures are left for the real call to report.
+ */
+export function prewarmLocalSpeech(): Promise<void> {
+  warm ??= detectSpeechEngine()
+    .then((engine) => engine?.speak("Ready.", TTS_SAMPLE_RATE))
+    .then(() => {})
+    .catch(() => {});
+  return warm;
+}
+
 /**
  * Fully local speech synthesis, emitting the same 24 kHz Int16 PCM stream as
  * the ElevenLabs speaker so the client cannot tell them apart.

@@ -174,6 +174,15 @@ Everything is in `.env`:
 | `THIRDCHAIR_MODEL` | `claude-opus-5` | Claude model for answers |
 | `THIRDCHAIR_EFFORT` | `low` | `low` = fastest spoken answers, `high` = deepest reasoning |
 | `PORT` | `8787` | Server port |
+| `THIRDCHAIR_STT_CONNECT_TIMEOUT_MS` | `5000` | Cloud STT connect deadline; a miss falls back to local whisper.cpp |
+| `THIRDCHAIR_STT_COMMIT_TIMEOUT_MS` | `8000` | Local: per-utterance whisper call. Cloud: last partial → commit (the partial is promoted on a miss) |
+| `THIRDCHAIR_LLM_FIRST_TOKEN_TIMEOUT_MS` | `2500` | No token by then → speak "One moment." and keep waiting |
+| `THIRDCHAIR_LLM_TOTAL_TIMEOUT_MS` | `25000` | Whole answer; a miss aborts it and speaks an apology |
+| `THIRDCHAIR_TTS_FIRST_BYTE_TIMEOUT_MS` | `4000` | Cloud: falls back to local speech. Local: continues as text |
+| `THIRDCHAIR_LATENCY_LOG` | `logs/latency.jsonl` | Per-turn latency records (JSONL); `off` disables |
+| `THIRDCHAIR_RECORD` / `THIRDCHAIR_RECORD_DIR` | off / `recordings` | Record each session's input audio for replay |
+| `THIRDCHAIR_SAY_VOICE` | system default | macOS `say` voice; a silent default voice is detected and replaced with Samantha |
+| `ELEVENLABS_WS_BASE` | `wss://api.elevenlabs.io` | Override for fault injection (e.g. `ws://127.0.0.1:1` forces both fallbacks) |
 
 ## Architecture
 
@@ -187,11 +196,16 @@ server/         Node + TypeScript
   trigger.ts    fuzzy wake-phrase matching + "wake alone, question next" flow
   brain.ts      Claude streaming answer, spoken-style system prompt
   tts.ts        Flash v2.5 stream-input websocket + sentence chunker
-  session.ts    one browser connection = one session; wires it all together
+  session.ts    one browser connection = one session; wires it all together,
+                per-turn deadlines, fallbacks, holding phrase
+  latency.ts    per-turn monotonic marks, p50/p95, JSONL turn log
+  recording.ts  opt-in input recording for scripts/replay.ts
 shared/         websocket protocol types shared by both sides
 ```
 
 Latency budget per answer: STT commit (~150 ms after you stop) → Claude first sentence (streamed) → Flash TTS first audio (~75 ms model latency) → playback. In practice the voice starts within roughly a second of you finishing the question.
+
+Per-component numbers measured on the local path: [Latency budget & resilience](#latency-budget--resilience).
 
 ### Input audio: what we control, and what only the OS can
 
@@ -352,6 +366,59 @@ The architecture deliberately mirrors how [Recall.ai](https://docs.recall.ai/doc
 - **Typed event stream.** Everything between browser and server is a discriminated-union message (`shared/protocol.ts`) — binary frames for audio, JSON events for everything else, one shared type definition on both sides.
 - **Reliability semantics.** Server-side ping/terminate heartbeats reap dead sessions; the client reconnects with exponential backoff and re-arms itself mid-meeting.
 - **Artifact retrieval.** As with Recall's post-call transcript API, the full speaker-attributed transcript is exportable at any point during the session.
+
+## Latency budget & resilience
+
+Every answer is a **turn** with a latency budget. The server stamps monotonic
+marks at each hop — VAD commit → final transcript → wake match → LLM request →
+first token → first sentence → TTS request → first audio byte — and the client
+reports when the first answer chunk actually becomes audible. Each turn becomes
+one JSON line in `logs/latency.jsonl` (schema: `TurnRecord` in
+`shared/protocol.ts`), rolling p50/p95 per component are kept in memory, and
+the UI shows the last turn as a stacked bar with the running p50/p95.
+
+```bash
+npx tsx scripts/latency-report.ts               # table + logs/latency-report.html
+THIRDCHAIR_RECORD=1 npm run dev                 # record input audio to recordings/
+npx tsx scripts/replay.ts recordings/<f>.tcrec  # replay in real time (--fast, --repeat N)
+npx tsx scripts/replay.ts --synth "hey copilot, what is two plus two?" --out recordings/q.tcrec
+```
+
+Replay sends the recorded frames through the same websocket and pipeline as a
+live session, so it produces the same records and exits non-zero if a turn
+fails — usable as a latency regression test.
+
+**Measured on the local path only** — whisper.cpp `base.en` + Ollama
+`llama3.2` (3B, Q4_K_M) + macOS `say`, on an Apple M5 Pro. 17 warm turns
+replaying one recorded question ("hey copilot, what is two plus two?"); with
+n = 17, p95 is effectively the maximum. Playback is reported by the headless
+replay client on receipt; one browser turn measured 55 ms there, which
+includes the browser's 50 ms jitter lead-in.
+
+| component (ms) | p50 | p95 |
+|---|---|---|
+| STT (VAD commit → transcript) | 73 | 388 |
+| wake / turn overhead | 0 | 2 |
+| LLM time to first token | 78 | 176 |
+| LLM first token → first sentence to TTS | 109 | 1170 |
+| TTS time to first byte (`say`, whole sentence) | 464 | 544 |
+| transport / playback (headless) | 0 | 1 |
+| **end-to-end, VAD commit → first audio** | **711** | **2120** |
+
+Not included: the local VAD waits 700 ms of silence before it commits, so
+add that to get end of speech → first audio. On this path `say` dominates —
+it renders a whole sentence before returning any audio — and the p95 tail is
+the model's first sentence running long.
+
+Failure handling, each exercised with fault injection on the same machine:
+
+| fault | behaviour | measured |
+|---|---|---|
+| cloud STT + TTS unreachable (`ELEVENLABS_WS_BASE=ws://127.0.0.1:1`) | both fall back to local for the session; UI shows a *degraded* badge | turns answered at 642 and 760 ms end-to-end |
+| cold Ollama (model load) | first-token deadline (2.5 s) speaks "One moment.", answer follows | first token 2848 ms, answer audio at 4036 ms |
+| LLM total deadline missed (forced to 90 ms) | answer aborted, apology spoken, back to listening | outcome `llm_timeout` |
+| brain unreachable | apology spoken, error shown | outcome `error`, apology audible at 578 ms |
+| barge-in | in-flight LLM, TTS and every turn timer cancelled | outcome `barged_in` |
 
 ## Roadmap
 
