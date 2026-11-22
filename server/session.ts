@@ -10,6 +10,7 @@ import { LocalTtsSpeaker, prewarmLocalSpeech } from "./tts-local.ts";
 import { detectSpeechEngine } from "./audio/speech.ts";
 import { TurnLatency, latencyStats, writeTurnRecord } from "./latency.ts";
 import { SessionRecorder } from "./recording.ts";
+import { modelLifecycle, PromptCalibration } from "./ollama.ts";
 import {
   config,
   configProblems,
@@ -140,6 +141,10 @@ export class Session {
   private ttsFallback = false;
   private localTtsName = "local";
   private recorder: SessionRecorder | null = null;
+  /** Tightens the context guard's estimate with this meeting's exact counts. */
+  private promptCalibration = new PromptCalibration();
+  /** Holds the local model resident while this session is listening. */
+  private holdsModel = false;
 
   constructor(private ws: WebSocket) {
     ws.on("message", (data, isBinary) => {
@@ -193,10 +198,12 @@ export class Session {
         this.active = true;
         if (msg.source) this.source = String(msg.source).slice(0, 120);
         this.startRecording();
+        this.holdModel(true);
         this.setState("listening");
         break;
       case "stop":
         this.active = false;
+        this.holdModel(false);
         this.interrupt();
         for (const stt of this.stt.values()) stt.stop();
         this.stt.clear();
@@ -222,6 +229,14 @@ export class Session {
         this.onPlaybackStarted(msg.turnId, msg.kind, Number(msg.leadMs));
         break;
     }
+  }
+
+  /** Load the model as the meeting starts; release it when it ends. */
+  private holdModel(hold: boolean): void {
+    if (hold === this.holdsModel) return;
+    this.holdsModel = hold;
+    if (hold) modelLifecycle.acquire();
+    else modelLifecycle.release();
   }
 
   private startRecording(): void {
@@ -384,11 +399,12 @@ export class Session {
       }
       chunker.push(delta);
       this.send({ type: "answer_delta", text: delta });
-    });
+    }, this.promptCalibration);
     turn.handle = handle;
 
     handle.done
       .then((text) => {
+        if (handle.usage) lat.llm = handle.usage;
         if (this.turn !== turn || turn.outcome) return;
         turn.cancel("llmFirstToken");
         turn.cancel("llmTotal");
@@ -719,5 +735,6 @@ export class Session {
     for (const turn of [...this.finishing.values()]) this.writeRecord(turn);
     this.recorder?.close();
     this.recorder = null;
+    this.holdModel(false);
   }
 }

@@ -26,6 +26,17 @@ const FRAME_MS = 128;
  * text, then trailing silence long enough for the VAD to commit.
  */
 export async function synthSession(texts: string[]): Promise<RecordedEvent[]> {
+  return synthMeeting(texts.map((text) => ({ text, silenceAfterMs: 2048 })));
+}
+
+/**
+ * Same, with a chosen silence after each utterance — long after a question
+ * so the answer finishes before the next line arrives (a line heard while
+ * the copilot is answering is treated as its own echo, by design).
+ */
+export async function synthMeeting(
+  items: { text: string; silenceAfterMs: number }[],
+): Promise<RecordedEvent[]> {
   const events: RecordedEvent[] = [
     { tMs: 0, kind: REC_CONTROL, payload: Buffer.from(JSON.stringify({ type: "start" })) },
   ];
@@ -36,7 +47,7 @@ export async function synthSession(texts: string[]): Promise<RecordedEvent[]> {
     chunk.copy(frame, 1);
     events.push({ tMs: (t += FRAME_MS), kind: REC_AUDIO, payload: frame });
   };
-  for (const text of texts) {
+  for (const { text, silenceAfterMs } of items) {
     const samples = await testSpeech(text, 16000);
     const pcm = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
     // Real capture always carries a moment of room tone before the first
@@ -47,7 +58,8 @@ export async function synthSession(texts: string[]): Promise<RecordedEvent[]> {
     }
     // Trailing silence: ends the utterance, and leaves room for the answer
     // before the next question when several are chained.
-    for (let i = 0; i < 16; i++) pushFrame(Buffer.alloc(FRAME_BYTES));
+    const tailFrames = Math.max(8, Math.ceil(silenceAfterMs / FRAME_MS));
+    for (let i = 0; i < tailFrames; i++) pushFrame(Buffer.alloc(FRAME_BYTES));
   }
   return events;
 }

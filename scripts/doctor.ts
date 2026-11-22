@@ -11,8 +11,7 @@
 import "dotenv/config";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { defaultWhisperModel } from "./lib/whisper-model.ts";
 import { detectSpeechEngine, speechInstallHint, voiceEnhancementHint } from "../server/audio/speech.ts";
 
 const OK = "  ok   ";
@@ -96,9 +95,7 @@ async function main() {
     } else {
       const bin =
         has("whisper-server") || has("whisper.cpp-server") || has("whisper-cpp-server");
-      const model =
-        process.env.WHISPER_MODEL ??
-        join(homedir(), ".cache", "whisper", "ggml-small.en.bin");
+      const model = defaultWhisperModel().path;
       line(
         FAIL,
         "voice in: whisper-server",

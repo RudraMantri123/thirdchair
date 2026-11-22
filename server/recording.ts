@@ -19,6 +19,12 @@ import { join } from "node:path";
  * server-side decision (VAD, transcription, wake match, answer) downstream.
  */
 const MAGIC = Buffer.from("TCREC1\n");
+/**
+ * Writes are not awaited, so a disk that cannot keep up would otherwise
+ * buffer the whole meeting in memory. Input audio is 32 kB/s; 8 MB is
+ * minutes of backlog, far past any healthy disk.
+ */
+const MAX_WRITE_BACKLOG = 8 * 1024 * 1024;
 export const REC_AUDIO = 0;
 export const REC_CONTROL = 1;
 
@@ -31,6 +37,7 @@ export interface RecordedEvent {
 export class SessionRecorder {
   private out: WriteStream;
   private readonly t0 = performance.now();
+  private dropped = 0;
   readonly path: string;
 
   constructor(dir: string, name: string) {
@@ -56,6 +63,12 @@ export class SessionRecorder {
   }
 
   private write(kind: number, payload: Buffer): void {
+    if (this.out.writableLength > MAX_WRITE_BACKLOG) {
+      if (this.dropped++ === 0) {
+        console.warn(`  recording ${this.path}: disk is not keeping up; dropping input until it drains`);
+      }
+      return;
+    }
     const head = Buffer.alloc(13);
     head.writeDoubleLE(performance.now() - this.t0, 0);
     head.writeUInt8(kind, 8);

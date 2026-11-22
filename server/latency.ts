@@ -7,6 +7,7 @@ import {
   type LatencyMark,
   type LatencyStat,
   type LatencySummary,
+  type LlmUsage,
   type TurnRecord,
   type TurnOutcome,
 } from "../shared/protocol.ts";
@@ -34,6 +35,7 @@ export class TurnLatency {
   readonly origin: number;
   readonly degraded = new Set<string>();
   clientLeadMs: number | null = null;
+  llm: LlmUsage | null = null;
 
   constructor(
     readonly turnId: string,
@@ -89,6 +91,7 @@ export class TurnLatency {
       clientLeadMs: this.clientLeadMs,
       degraded: [...this.degraded],
       outcome,
+      ...(this.llm ? { llm: this.llm } : {}),
     };
   }
 }

@@ -25,6 +25,15 @@ const MAX_UTTERANCE_MS = 30000;
  * 16 kHz mono it costs 32 kB.
  */
 const PRE_ROLL_MS = 1024;
+/**
+ * Utterances allowed to wait for whisper. Each can be up to 30 s of audio
+ * (~960 kB), and nothing else bounds this queue: a stalled whisper-server
+ * would otherwise grow it for as long as people keep talking. Whisper runs
+ * far faster than real time when healthy, so this is only reached when it is
+ * not; the oldest waiting utterance is the one dropped, because the newest is
+ * the one most likely to be a question.
+ */
+const MAX_PENDING_UTTERANCES = 4;
 
 /**
  * Phrases Whisper emits when handed near-silence — artefacts of its training
@@ -84,7 +93,8 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
   private lastError = "";
   private vad = new AdaptiveVad();
   // Serialize whisper calls so utterances come back in spoken order.
-  private inference: Promise<void> = Promise.resolve();
+  private pending: { pcm: Int16Array; speechEndAt: number }[] = [];
+  private draining = false;
   private clipped = 0;
   private frames = 0;
   private warnedClipping = false;
@@ -109,6 +119,7 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
     this.inflight = new AbortController();
     this.utterance.clear();
     this.preRoll.clear();
+    this.pending = [];
     this.inSpeech = false;
   }
 
@@ -202,7 +213,26 @@ export class LocalSttStream extends EventEmitter<SttEvents> {
   }
 
   private enqueue(pcm: Int16Array, speechEndAt: number): void {
-    this.inference = this.inference.then(() => this.transcribe(pcm, speechEndAt));
+    this.pending.push({ pcm, speechEndAt });
+    if (this.pending.length > MAX_PENDING_UTTERANCES) {
+      this.pending.shift();
+      this.emit(
+        "error",
+        "Local STT is falling behind (whisper-server slow or stalled); an older utterance was dropped.",
+      );
+    }
+    if (!this.draining) void this.drain();
+  }
+
+  private async drain(): Promise<void> {
+    this.draining = true;
+    try {
+      for (let next = this.pending.shift(); next; next = this.pending.shift()) {
+        await this.transcribe(next.pcm, next.speechEndAt);
+      }
+    } finally {
+      this.draining = false;
+    }
   }
 
   private async transcribe(pcm: Int16Array, speechEndAt: number): Promise<void> {

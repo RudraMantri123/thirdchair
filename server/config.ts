@@ -19,6 +19,22 @@ if (!["claude", "groq", "ollama"].includes(brain)) {
 
 const elevenLabsApiKey = key("ELEVENLABS_API_KEY");
 
+/**
+ * Resource profile. "low-memory" swaps in smaller local models where an
+ * explicit setting does not already choose one; see README, "Memory
+ * footprint", for what it saves and what it costs.
+ */
+const profile = (process.env.THIRDCHAIR_PROFILE ?? "default") as
+  | "default"
+  | "low-memory";
+if (!["default", "low-memory"].includes(profile)) {
+  console.error(
+    `THIRDCHAIR_PROFILE must be "default" or "low-memory" (got "${profile}").`,
+  );
+  process.exit(1);
+}
+const lowMemory = profile === "low-memory";
+
 /** A positive integer env var in milliseconds, else the default. */
 function ms(name: string, fallback: number): number {
   const v = Number(process.env[name]);
@@ -43,10 +59,27 @@ export const config = {
     | "high",
   groqModel: process.env.GROQ_MODEL ?? "llama-3.3-70b-versatile",
   ollamaUrl: process.env.OLLAMA_URL ?? "http://localhost:11434",
-  ollamaModel: process.env.OLLAMA_MODEL ?? "llama3.2",
+  profile,
+  ollamaModel:
+    process.env.OLLAMA_MODEL ?? (lowMemory ? "qwen2.5:1.5b" : "llama3.2"),
   // Ollama defaults to 4096 and silently truncates the prompt from the FRONT,
   // so the model answers confidently about a meeting whose start it never saw.
+  // The KV cache is allocated for the whole window, so this is a memory
+  // setting. 8192 is the largest prompt measured over 2-hour meetings plus
+  // the answer reserve (scripts/prompt-size-probe.ts): 5,236 tokens for
+  // ordinary talk, but 7,642 when half the talk is figures and ticket ids and
+  // 7,476 for back-to-back monologues. 6144 fits ordinary talk and saves
+  // ~120 MB at q8_0; either way a prompt that would not fit grows the window
+  // instead of being truncated (server/ollama.ts).
   ollamaNumCtx: Number(process.env.OLLAMA_NUM_CTX ?? 8192),
+  // "session": load the model when a meeting starts, hold it for the meeting,
+  // release it when the last one ends. "daemon": leave it to Ollama's own
+  // keep-alive (default 5 minutes after the last request).
+  ollamaLifecycle: (process.env.THIRDCHAIR_OLLAMA_LIFECYCLE ?? "session") as
+    | "session"
+    | "daemon",
+  // Lease length while a meeting is live; renewed at half this interval.
+  ollamaLeaseMinutes: ms("THIRDCHAIR_OLLAMA_LEASE_MIN", 10),
   // Memory profile: "full" keeps every word (fine for Claude's window),
   // "compact" digests older segments to fit a small local context.
   memoryProfile: (process.env.THIRDCHAIR_MEMORY ??

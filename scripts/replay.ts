@@ -10,6 +10,7 @@
  *                            --out recordings/two-plus-two.tcrec [--no-run]
  * Repeat for percentiles:  npx tsx scripts/replay.ts <file> --repeat 5
  * Print server events:     --verbose
+ * Quiet time before a run counts as finished: --settle MS (default 3000)
  *
  * --fast removes wall-clock pacing. VAD is sample-counted, so utterance
  * boundaries are unchanged, but a multi-question recording can then deliver
@@ -41,6 +42,7 @@ const out = flag("--out");
 const url = flag("--url") ?? "ws://localhost:8787/ws";
 const repeat = Math.max(1, Number(flag("--repeat") ?? 1));
 const speed = has("--fast") ? Infinity : Number(flag("--speed") ?? 1);
+const settleMs = Number(flag("--settle") ?? 3000);
 const file = args.find(
   (a, i) => !a.startsWith("--") && !args[i - 1]?.startsWith("--"),
 );
@@ -79,6 +81,7 @@ for (let run = 1; run <= repeat; run++) {
   const res = await runHeadless(events, {
     url,
     speed,
+    settleMs,
     source: `replay:${label}${Number.isFinite(speed) ? `@${speed}x` : "@fast"}`,
     onMessage: has("--verbose")
       ? (msg) => {

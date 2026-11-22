@@ -104,6 +104,27 @@ export interface TurnRecord {
   /** Fallbacks and deadline misses that shaped this turn. Empty = clean. */
   degraded: string[];
   outcome: TurnOutcome;
+  /**
+   * What the model was actually asked to process, when the brain reports it
+   * (local Ollama does). Optional: absent on older records and cloud brains.
+   */
+  llm?: LlmUsage;
+}
+
+/** Prompt accounting for one answer, as reported by the model server. */
+export interface LlmUsage {
+  /** Exact prompt tokens, from the server's own tokenizer. */
+  promptTokens: number;
+  /** Generated tokens. */
+  evalTokens: number;
+  /** Context window (num_ctx) the request ran with. */
+  numCtx: number;
+  /** Our pre-flight estimate for the same prompt, for calibration. */
+  estimatedTokens: number;
+  /** Time the server spent loading the model for this request (cold start). */
+  loadMs: number;
+  /** Time spent evaluating the uncached part of the prompt. */
+  promptEvalMs: number;
 }
 
 export interface LatencyStat {

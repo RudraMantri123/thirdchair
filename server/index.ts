@@ -20,6 +20,12 @@ const MIME: Record<string, string> = {
 // In production (`npm run build && npm start`) the server also serves the
 // built web client. In dev, Vite serves the client and proxies /ws here.
 const server = createServer(async (req, res) => {
+  // Process memory, for scripts/memory-report.ts. Numbers only, no content.
+  if (req.url === "/debug/memory") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ pid: process.pid, ...process.memoryUsage() }));
+    return;
+  }
   const path = normalize(req.url?.split("?")[0] ?? "/").replace(/^(\.\.[/\\])+/, "");
   const file = path === "/" ? "index.html" : path.slice(1);
   try {

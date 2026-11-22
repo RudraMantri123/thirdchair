@@ -9,18 +9,18 @@
  *
  * Run: npm run voice:local
  */
+import "dotenv/config";
 import { spawn, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { defaultWhisperModel } from "./lib/whisper-model.ts";
 
 // small.en by default: measured markedly more robust than base.en on the
 // conditions a real room produces (office noise 21.7% -> 15.2% WER, quiet
 // speaker 26.1% -> 17.4%) for only +52 ms per utterance. base.en remains a
 // fine choice on a slow machine — set WHISPER_MODEL to it.
-const MODEL =
-  process.env.WHISPER_MODEL ??
-  join(homedir(), ".cache", "whisper", "ggml-small.en.bin");
+// A q5_1 copy is used when present (half the memory, same measured WER);
+// see scripts/lib/whisper-model.ts.
+const MODEL = defaultWhisperModel().path;
 const PORT = process.env.WHISPER_PORT ?? "8788";
 
 // Homebrew ships `whisper-server`; a source build produces `whisper-server`

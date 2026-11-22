@@ -1,6 +1,14 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { config } from "./config.ts";
 import type { PromptSections } from "./memory/index.ts";
+import type { LlmUsage } from "../shared/protocol.ts";
+import {
+  contextWindow,
+  estimatePromptTokens,
+  modelLifecycle,
+  PromptCalibration,
+  RESPONSE_RESERVE_TOKENS,
+} from "./ollama.ts";
 
 /**
  * The system prompt is FROZEN — no timestamps, no per-meeting detail, nothing
@@ -40,12 +48,16 @@ function volatileBlock(sections: PromptSections, question: string): string {
 export interface AnswerHandle {
   done: Promise<string>;
   abort: () => void;
+  /** Prompt accounting, set before `done` resolves when the brain reports it. */
+  usage?: LlmUsage;
 }
 
 export function answer(
   question: string,
   sections: PromptSections,
   onDelta: (text: string) => void,
+  /** The session's prompt-size calibration (local Ollama only). */
+  calibration: PromptCalibration = new PromptCalibration(),
 ): AnswerHandle {
   switch (config.brain) {
     case "claude":
@@ -60,15 +72,24 @@ export function answer(
         onDelta,
       );
     case "ollama":
-      return openAiCompatAnswer(
-        `${config.ollamaUrl}/v1`,
-        undefined,
-        config.ollamaModel,
-        question,
-        sections,
-        onDelta,
-      );
+      return ollamaAnswer(question, sections, onDelta, calibration);
   }
+}
+
+/** System + one user message, stable content first. Shared by both
+ * OpenAI-style and native paths so the prompt bytes are identical. */
+export function chatMessages(question: string, sections: PromptSections) {
+  return [
+    { role: "system", content: SYSTEM_PROMPT },
+    // One user message, stable content first: the KV cache matches the
+    // longest common prefix, so history must precede the question.
+    {
+      role: "user",
+      content: sections.stable
+        ? `${sections.stable}\n\n${volatileBlock(sections, question)}`
+        : volatileBlock(sections, question),
+    },
+  ];
 }
 
 // ---- Claude -----------------------------------------------------------------
@@ -143,24 +164,8 @@ function openAiCompatAnswer(
       model,
       stream: true,
       max_tokens: 1000,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        // One user message, stable content first: the KV cache matches the
-        // longest common prefix, so history must precede the question.
-        {
-          role: "user",
-          content: sections.stable
-            ? `${sections.stable}\n\n${volatileBlock(sections, question)}`
-            : volatileBlock(sections, question),
-        },
-      ],
+      messages: chatMessages(question, sections),
     };
-    if (config.brain === "ollama") {
-      // Without an explicit num_ctx, Ollama defaults to 4096 and silently
-      // truncates the prompt from the FRONT — the model then answers
-      // confidently about a meeting whose first half it never saw.
-      body.options = { num_ctx: config.ollamaNumCtx };
-    }
 
     const res = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
@@ -205,4 +210,99 @@ function openAiCompatAnswer(
   })();
 
   return { done, abort: () => ctrl.abort() };
+}
+
+// ---- Ollama (native API) -----------------------------------------------------
+
+/**
+ * Local Ollama through its native /api/chat rather than the OpenAI shim, for
+ * three things the shim does not carry: the exact prompt token count (to
+ * prove no prompt overflowed the window), load time (to see cold starts),
+ * and keep_alive (to hold the model for the meeting, see ollama.ts).
+ */
+function ollamaAnswer(
+  question: string,
+  sections: PromptSections,
+  onDelta: (text: string) => void,
+  calibration: PromptCalibration,
+): AnswerHandle {
+  const ctrl = new AbortController();
+  const messages = chatMessages(question, sections);
+  // Pre-flight: never send a prompt that would not fit. Ollama would not
+  // refuse it; it would silently drop the start of the meeting.
+  const rawEstimate = estimatePromptTokens(messages);
+  const estimatedTokens = calibration.correct(rawEstimate);
+  const numCtx = contextWindow.fit(estimatedTokens);
+  const handle: AnswerHandle = { done: Promise.resolve(""), abort: () => ctrl.abort() };
+
+  handle.done = (async () => {
+    const res = await fetch(`${config.ollamaUrl}/api/chat`, {
+      method: "POST",
+      signal: ctrl.signal,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: config.ollamaModel,
+        stream: true,
+        messages,
+        keep_alive: modelLifecycle.keepAlive,
+        options: { num_ctx: numCtx, num_predict: RESPONSE_RESERVE_TOKENS },
+      }),
+    });
+    if (!res.ok || !res.body) {
+      throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let full = "";
+    const handleLine = (line: string) => {
+      if (!line.trim()) return;
+      let j: {
+        message?: { content?: string };
+        done?: boolean;
+        error?: string;
+        prompt_eval_count?: number;
+        eval_count?: number;
+        load_duration?: number;
+        prompt_eval_duration?: number;
+      };
+      try {
+        j = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (j.error) throw new Error(j.error);
+      const delta = j.message?.content;
+      if (delta) {
+        full += delta;
+        onDelta(delta);
+      }
+      if (j.done) {
+        const promptTokens = j.prompt_eval_count ?? 0;
+        handle.usage = {
+          promptTokens,
+          evalTokens: j.eval_count ?? 0,
+          numCtx,
+          estimatedTokens,
+          loadMs: Math.round((j.load_duration ?? 0) / 1e6),
+          promptEvalMs: Math.round((j.prompt_eval_duration ?? 0) / 1e6),
+        };
+        calibration.observe(rawEstimate, promptTokens);
+        contextWindow.verify(promptTokens, numCtx);
+      }
+    };
+    for (;;) {
+      const { done: eof, value } = await reader.read();
+      if (eof) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) handleLine(line);
+    }
+    handleLine(buffer);
+    return full;
+  })();
+
+  return handle;
 }

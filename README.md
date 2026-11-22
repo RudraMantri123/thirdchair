@@ -169,6 +169,10 @@ Everything is in `.env`:
 | `GROQ_API_KEY` | — | Required when brain is `groq` (free at console.groq.com) |
 | `GROQ_MODEL` | `llama-3.3-70b-versatile` | Any Groq-hosted model |
 | `OLLAMA_URL` / `OLLAMA_MODEL` | `localhost:11434` / `llama3.2` | Local Ollama endpoint and model |
+| `OLLAMA_NUM_CTX` | `8192` | Context window (sizes the KV cache). Measured, see [Memory footprint](#memory-footprint); `6144` fits ordinary talk. A prompt that would not fit grows it instead of being truncated |
+| `THIRDCHAIR_OLLAMA_LIFECYCLE` | `session` | `session`: load the model when listening starts, release it when the last session stops. `daemon`: leave it to Ollama's keep-alive |
+| `THIRDCHAIR_OLLAMA_LEASE_MIN` | `10` | keep_alive lease while a meeting is live, renewed at half this interval |
+| `THIRDCHAIR_PROFILE` | `default` | `low-memory`: `qwen2.5:1.5b` and whisper `base.en` (q5_1 if present) unless set explicitly. Costs answer quality; see below |
 | `ELEVENLABS_VOICE_ID` | Rachel | Any voice from your ElevenLabs voice library |
 | `WAKE_PHRASE` | `hey copilot` | Whatever you want to call it |
 | `THIRDCHAIR_MODEL` | `claude-opus-5` | Claude model for answers |
@@ -200,6 +204,7 @@ server/         Node + TypeScript
                 per-turn deadlines, fallbacks, holding phrase
   latency.ts    per-turn monotonic marks, p50/p95, JSONL turn log
   recording.ts  opt-in input recording for scripts/replay.ts
+  ollama.ts     local model lifecycle + context-window guard (see Memory footprint)
 shared/         websocket protocol types shared by both sides
 ```
 
@@ -419,6 +424,196 @@ Failure handling, each exercised with fault injection on the same machine:
 | LLM total deadline missed (forced to 90 ms) | answer aborted, apology spoken, back to listening | outcome `llm_timeout` |
 | brain unreachable | apology spoken, error shown | outcome `error`, apology audible at 578 ms |
 | barge-in | in-flight LLM, TTS and every turn timer cancelled | outcome `barged_in` |
+
+## Memory footprint
+
+On the fully local path three processes hold memory: the Ollama runner (model
+weights + KV cache), whisper-server, and ThirdChair's own Node process. All
+numbers below were measured on one machine with
+`scripts/memory-report.ts`, which samples every process while a replay drives
+the real pipeline and prints a table:
+
+```bash
+npx tsx scripts/memory-report.ts --run "npx tsx scripts/meeting-regression.ts"
+npx tsx scripts/memory-report.ts --duration 30            # just watch
+```
+
+"Footprint" is macOS `phys_footprint` (Activity Monitor's *Memory* column):
+it includes Metal allocations and compressed pages, which RSS misses — an idle
+whisper-server shows ~10 MB RSS while owning ~210 MB. `ollama ps` size is
+Ollama's own accounting of weights + KV cache + compute graph.
+
+**Setup.** Apple M5 Pro, 24 GB, Ollama 0.20.7 (Metal; flash attention is
+already *auto → enabled* for llama3.2 on this build), llama3.2 3B Q4_K_M,
+whisper.cpp `base.en`, macOS `say`. ThirdChair talked to a dedicated Ollama
+daemon; **another unrelated benchmark was running on a second Ollama daemon
+on the same GPU throughout**, so latency moved by up to a second between
+otherwise identical runs; no latency claim below rests on those deltas except
+the first-turn model load. Quality and memory
+were measured with `scripts/meeting-regression.ts`: an 8-minute synthesized
+meeting (70 utterances) that states seven facts in the first minute, buries
+them under 45 lines of ordinary talk so they are sealed into history, then
+asks about them through the full voice pipeline (VAD → whisper → wake phrase
+→ memory → model → voice), scored by keyword.
+
+### Before / after
+
+| | `ollama ps` in meeting | runner footprint | idle (+15 s after the meeting) | regression score | e2e p50 / p95 | 1st-turn TTFT |
+|---|---|---|---|---|---|---|
+| `main` as shipped — **ran at num_ctx 4096**, see 1. | 2,623 MB | 635 MB | resident until Ollama's 5-min timer | 6/8 | 2,371 / 5,717 ms | 3,729 ms (cold) |
+| 1. fixed: num_ctx 8192 actually applied, f16 KV | 3,238 MB | 1,071 MB | 3,238 MB | 6/8 | 1,644 / 4,465 ms | 3,429 ms (cold, 2.1 s load) |
+| 2. + KV cache q8_0 (daemon setting) | 2,790 MB | 663 MB | 2,790 MB | 5/8 ¹ | 1,531 / 1,903 ms | ¹ |
+| 3. + num_ctx 6144 (opt-in) | 2,578 MB | 546 MB | 2,578 MB | 6/8 | 2,572 / 3,357 ms | 2,143 ms (cold) |
+| 4. + session lifecycle, at 6144 | 2,578 MB | 543 MB | **0 MB** | 6/8 | 2,053 / 2,807 ms | 1,300 ms (preloaded) |
+| **new defaults: 8192 + q8_0 + session lifecycle** | **2,790 MB** | **662 MB** | **0 MB** | **6/8** | 2,056 / 3,188 ms | **1,250 ms** (preloaded) |
+| 5. low-memory profile: `qwen2.5:1.5b` + `base.en-q5_1` (opt-in) | 1,318 MB | 255 MB | 0 MB | 5/8, visibly worse answers | 1,627 / 2,739 ms | 696 ms |
+| (rejected) `llama3.2:1b` + `base.en-q5_1` | 1,760 MB | 284 MB | 0 MB | 2/8 | — | — |
+
+ThirdChair's Node process sat at 25–130 MB RSS and 12–20 MB heap in every
+configuration; nothing here changes it measurably. whisper-server `base.en`
+stayed at 209–283 MB footprint (peaks during inference).
+
+The 6/8 ceiling is the same in every 3B row and is not memory-related: one
+question's wake phrase is misheard by `base.en` ("Here couple it…") in every
+run, and the 3B model fails "what is the project codeword?" every time, from
+an unaltered prompt. ¹ The q8_0 run's first question hit an 11.6 s cold load
+(fresh daemon, contended GPU) and was barged in by the next question; the
+other six answered questions had the same outcomes as the f16 run.
+
+**What changed, and why each is or isn't a default**
+
+1. **`main` was not applying `num_ctx` at all.** The Ollama brain used the
+   OpenAI-compatible endpoint, which ignores `options`, so every request ran
+   at Ollama's 4096 default (`ollama ps` during the run: `CONTEXT 4096`).
+   Ollama does not reject an oversized prompt: a 1,843-token prompt sent with
+   a 1,024 window came back with `prompt_eval_count` 1024, no error, and only
+   a `truncating input prompt` line in the daemon log. Prompts in a long
+   meeting reach ~5,200 tokens (below), so `main` would have silently
+   dropped the start of the meeting — the exact bug that once cut recall to
+   43%. The Ollama brain now uses the native `/api/chat`, which honours
+   `num_ctx` and `keep_alive` and reports exact prompt token counts. This
+   *costs* memory relative to `main` (the fix row), and is not optional.
+2. **KV cache q8_0: −448 MB** (KV 896 → 476 MiB at 8192, per the runner's
+   own log). Answers unchanged on the regression set. This is an Ollama
+   *server* setting, so ThirdChair cannot set it for you — recommended:
+
+   ```bash
+   OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 ollama serve
+   ```
+3. **num_ctx: measured, guarded, and still 8192 by default.** It was sized
+   from measurement, not guessed: `scripts/prompt-size-probe.ts` drives the
+   memory layer through three 2-hour meetings and has Ollama count every
+   rendered prompt with the model's own tokenizer and chat template.
+
+   | 2-hour meeting | largest prompt | at minute |
+   |---|---|---|
+   | ordinary talk | 5,236 tokens | 80 |
+   | half the talk is figures, ticket ids, versions | 7,642 tokens | 98 |
+   | every utterance a 30 s monologue (upper bound) | 7,476 tokens | 80 |
+
+   The memory layer caps history, so prompts peak and then plateau rather
+   than growing with the meeting. But its cap is a bytes/4 estimate, and
+   number-dense talk packs ~1.5x more tokens per byte, which is why that
+   meeting peaks highest. 8192 is the measured maximum plus the answer
+   reserve, so it stays the default. `OLLAMA_NUM_CTX=6144` fits ordinary talk
+   and saves 212 MB at f16 (row 3), ~120 MB at q8_0; when a meeting outgrows
+   it, the guard below grows the window once rather than truncating.
+
+   **The guard.** Because a too-small window fails silently, every request is
+   now checked before it is sent. The estimate counts word/digit/punctuation
+   pieces — bytes per token is useless here, measured anywhere from 2.25
+   (figures) to 4.8 (prose) — and is corrected per meeting from the previous
+   prompt's exact count, since consecutive prompts share almost all their
+   content. Across all three meetings above the corrected estimate never
+   under-counted by more than 20 tokens, inside the 256-token answer reserve. It
+   does over-count large jumps: in the monologue meeting it asked for 8,324
+   tokens of window for a 7,476-token prompt, so that meeting grows to 9,216.
+   If prompt + reserve would not fit, the window grows (one model reload,
+   logged as `[ctx-guard]`) instead of truncating; after each answer the
+   exact count is checked again. Verified by forcing `OLLAMA_NUM_CTX=2048`
+   against a 6,723-token prompt with a fact in its first line: the guard grew
+   the window to 8192 and the answer contained the fact. Exact count,
+   estimate, window and load time are now in every turn record (`llm` in
+   `logs/latency.jsonl`).
+4. **Session lifecycle (default): idle model memory 2.8 GB → 0.** The model is
+   loaded when listening starts (927 ms here, off the answer path), held with
+   a renewed 10-minute lease for the meeting, and released with
+   `keep_alive: 0` when the last session stops. Before, the model idled for
+   five minutes after the last question — and, worse, a meeting quiet for
+   more than five minutes unloaded it and paid a cold start on the next
+   question. With preloading, the first turn's model load fell from 2,139 ms to
+   61 ms (first-turn TTFT 3,429 → 1,250 ms; the rest is evaluating a prompt
+   the cache has not seen yet). If a question does arrive while the model is still loading, the
+   existing 2.5 s first-token deadline speaks "One moment." (seen in practice: a
+   fresh daemon took 11.6 s to load and the phrase covered it; in the 200-session
+   leak run below, 27 questions arrived during the preload and all 27 were
+   covered by it). Unloading is daemon-wide; set
+   `THIRDCHAIR_OLLAMA_LIFECYCLE=daemon` if other tools share the model.
+5. **Low-memory profile: opt-in, not default.** `THIRDCHAIR_PROFILE=low-memory`
+   halves the model's memory (2,578 → 1,318 MB) with `qwen2.5:1.5b`, but
+   answers get worse: 5/8, with rambling, a wrong owner ("You own the security
+   questionnaire"), and prompt text leaking into speech. `llama3.2:1b` was
+   worse still (2/8, it parroted the decision journal) and was rejected. Use
+   it when the alternative is not running at all.
+
+### Speech recognition models
+
+Quantized whisper models were made locally with `whisper-quantize` (no
+download needed). Word error rate from `scripts/ingest-eval.ts` (46 words,
+6 utterances, the production decode settings), footprint after use,
+mean latency on a 7.2 s utterance from `scripts/stt-latency-eval.ts`
+(contended GPU, so latency is indicative only):
+
+| model | clean | office noise | quiet speaker | footprint | latency |
+|---|---|---|---|---|---|
+| `base.en` | 19.6% | 28.3% | 37.0% | 221 MB | 356 ms |
+| `base.en-q5_1` | 19.6% | 26.1% | 30.4% | 152 MB | 580 ms |
+| `small.en` | 19.6% | 19.6% | 21.7% | 678 MB | 1,291 ms |
+| `small.en-q5_1` | 19.6% | 19.6% | 17.4% | **380 MB** | 629 ms |
+
+`small.en-q5_1` matched `small.en` (one word better on the quiet speaker) at
+**−298 MB**, so `npm run voice:local` now loads a `-q5_1` copy whenever one
+exists next to the model (`scripts/lib/whisper-model.ts`):
+
+```bash
+cd ~/.cache/whisper && whisper-quantize ggml-small.en.bin ggml-small.en-q5_1.bin q5_1
+```
+
+On a 46-word set one word is 2.2 points, so treat these as "no regression",
+not as quantization being *better*. `tiny.en` was not evaluated: no copy was
+obtainable on this machine without Hugging Face.
+
+### Leaks and bounded buffers
+
+Two replays, sampled every 10–15 s by `memory-report.ts` with the new
+defaults:
+
+| run | turns | ThirdChair heap | ThirdChair RSS | heap trend |
+|---|---|---|---|---|
+| 200 sessions × 1 question (`replay.ts --repeat 200 --fast`), 13 min | 191 answered ² | 11.3 → 16.1 MB (15.5 at end) | 27–76 MB | +3.6 MB/h |
+| one 44-minute meeting, 64 questions, 310 utterances (`meeting-regression.ts --long`), 15 min | 54 answered ³ | 11.5 → 16.3 MB (15.4 at end) | 30–81 MB | +5.7 MB/h |
+
+Trends are least squares after the first quarter (warm-up excluded); both are
+flat within GC noise, and nothing needed fixing on the Node side. The model
+was loaded and released 200 times in the first run (preload 233–2,185 ms,
+200 releases logged, `ollama ps` at 0 when it ended), and whisper-server stayed at
+209–283 MB throughout. ² The other 9 runs ended before whisper returned
+(the harness's 500 ms settle window, on a contended GPU); none errored.
+³ The other 10 questions were never triggered (wake phrase or question
+misheard by `base.en`); 42/54
+answered correctly, and the largest real prompt was 2,256 tokens.
+
+Every buffer on the audio path is now bounded by construction:
+
+| buffer | bound |
+|---|---|
+| utterance / pre-roll (local STT) | fixed rings, 30 s and 1 s |
+| local STT queue | **was unbounded** (a stalled whisper-server grew it while people kept talking); now 4 utterances, oldest dropped with an error |
+| cloud STT reconnect queue | 50 frames |
+| input recording | **writes were never back-pressured**; now drops input past 8 MB of unflushed backlog, with a warning |
+| latency window | 500 turns per component |
+| transcript / memory | grows with the meeting by design (it *is* the meeting); prompt contribution is bounded by `historyBudget` |
+| browser playback queue | one `AudioBufferSourceNode` per scheduled chunk, released on `ended` / barge-in |
 
 ## Roadmap
 
